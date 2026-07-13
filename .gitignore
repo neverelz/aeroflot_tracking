@@ -1,0 +1,22 @@
+# Секреты — никогда не коммитить!
+.env
+
+# Виртуальное окружение
+.venv/
+venv/
+
+# Данные и логи
+prices.csv
+tracker.log
+screenshot_*.png
+timeout_screenshot.png
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.idea/
+.vscode/
+/tasks.json
