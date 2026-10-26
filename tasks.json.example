@@ -1,16 +1,10 @@
 [
   {
+    "request_id": "a1b2c3d4",
     "chat_id": "ID_ТЕЛЕГРАМ",
-    "origin": "откуда",
-    "dest": "куда",
-    "date": "дата",
-    "threshold": лимит (сумма)
-  },
-  {
-    "chat_id": "ID_ТЕЛЕГРАМ",
-    "origin": "откуда",
-    "dest": "куда",
-    "date": "дата",
-    "threshold": лимит (сумма)
+    "origin": "SVO",
+    "dest": "AER",
+    "date": "14.08.2027",
+    "threshold": 15000
   }
 ]

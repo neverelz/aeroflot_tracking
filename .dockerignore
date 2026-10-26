@@ -1,0 +1,15 @@
+.git
+.gitignore
+.idea
+.vscode
+.venv
+venv
+__pycache__
+*.py[cod]
+.env
+data
+prices.csv
+tasks.json
+tracker.log
+screenshot_*.png
+tests

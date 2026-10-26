@@ -20,3 +20,7 @@ __pycache__/
 .idea/
 .vscode/
 /tasks.json
+
+# Общее хранилище Docker-сервисов
+/data/*
+!/data/.gitkeep

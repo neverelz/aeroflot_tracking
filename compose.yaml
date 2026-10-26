@@ -1,0 +1,33 @@
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: aeroflot-tracking:local
+    command: ["python", "bot.py"]
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /app/data
+      TZ: Europe/Moscow
+    volumes:
+      - ./data:/app/data
+    init: true
+    restart: unless-stopped
+
+  tracker:
+    image: aeroflot-tracking:local
+    command: ["python", "tracker.py"]
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /app/data
+      HEADLESS: "true"
+      TZ: Europe/Moscow
+    volumes:
+      - ./data:/app/data
+    init: true
+    restart: unless-stopped
+    shm_size: 1gb
+    depends_on:
+      - bot

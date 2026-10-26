@@ -23,15 +23,21 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 from telegram import Bot
 from telegram.error import TelegramError
 
+from task_store import contains_task
+
 # ── Настройки ──────────────────────────────────────────────────────────────────
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHECK_INTERVAL     = int(os.getenv("CHECK_INTERVAL", "3"))
+HEADLESS           = os.getenv("HEADLESS", "false").strip().lower() in {"1", "true", "yes", "on"}
 
-BASE_DIR   = Path(__file__).parent
-CSV_FILE   = BASE_DIR / "prices.csv"
-TASKS_FILE = BASE_DIR / "tasks.json"
+BASE_DIR = Path(__file__).parent
+DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR)))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+CSV_FILE = DATA_DIR / "prices.csv"
+TASKS_FILE = DATA_DIR / "tasks.json"
+LOG_FILE = DATA_DIR / "tracker.log"
 
 # ── Логирование ────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -39,18 +45,21 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("tracker.log", encoding="utf-8"),
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
     ],
 )
 log = logging.getLogger(__name__)
+# httpx включает токен Telegram в URL на уровне INFO — не пишем такие строки в лог.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
 
 
 # ── Работа с заданиями (JSON) ──────────────────────────────────────────────────
 def load_tasks() -> list[dict]:
     """Загружает список задач для проверки из JSON файла."""
     if not TASKS_FILE.exists():
-        log.error(f"Файл {TASKS_FILE} не найден! Создайте его по примеру.")
-        sys.exit(1)
+        log.warning("Файл %s пока не создан — ожидаем первую заявку из бота.", TASKS_FILE)
+        return []
 
     try:
         with open(TASKS_FILE, "r", encoding="utf-8") as f:
@@ -263,7 +272,7 @@ async def run_all_tasks(is_test: bool = False) -> None:
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
-            headless=False,
+            headless=HEADLESS,
             slow_mo=300,
             args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
         )
@@ -276,6 +285,14 @@ async def run_all_tasks(is_test: bool = False) -> None:
         await context.add_init_script("Object.defineProperty(navigator, 'webdriver', { get: () => undefined });")
 
         for i, task in enumerate(tasks):
+            if not contains_task(load_tasks(), task):
+                log.info(
+                    "Заявка %s на %s удалена — пропускаем.",
+                    task.get("request_id", "без номера"),
+                    task.get("date", "неизвестную дату"),
+                )
+                continue
+
             await process_task(context, task, is_test)
 
             # Делаем паузу между проверками разных билетов,
