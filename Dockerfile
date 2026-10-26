@@ -11,7 +11,7 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py tracker.py task_store.py ./
+COPY bot.py tracker.py task_store.py airport_catalog.py calendar_ui.py ./
 RUN mkdir -p /app/data
 
 CMD ["python", "bot.py"]

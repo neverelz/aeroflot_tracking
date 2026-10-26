@@ -4,6 +4,7 @@ import uuid
 from datetime import date
 from pathlib import Path
 
+from airport_catalog import find_airports
 from bot import (
     BUTTON_AIRPORTS,
     BUTTON_HELP,
@@ -14,6 +15,7 @@ from bot import (
     parse_threshold,
     resolve_airport,
 )
+from calendar_ui import build_calendar
 from task_store import TaskStore, contains_task, dates_between
 
 
@@ -26,9 +28,27 @@ class BotParsingTests(unittest.TestCase):
         )
 
     def test_resolve_city_and_iata(self):
-        self.assertEqual(resolve_airport(" Москва "), "SVO")
+        self.assertEqual(resolve_airport(" Москва "), "MOW")
         self.assertEqual(resolve_airport("led"), "LED")
         self.assertIsNone(resolve_airport("Неизвестный город"))
+
+    def test_airport_suggestions_are_limited_to_catalog(self):
+        self.assertEqual(
+            [airport.code for airport in find_airports("Москва")],
+            ["MOW", "SVO"],
+        )
+        self.assertEqual(find_airports("KRD"), [])
+
+    def test_calendar_disables_dates_outside_period(self):
+        markup = build_calendar(
+            "single",
+            date(2026, 10, 1),
+            min_date=date(2026, 10, 26),
+            max_date=date(2026, 11, 30),
+        )
+        callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
+        self.assertIn("cal:day:single:2026-10-26", callbacks)
+        self.assertNotIn("cal:day:single:2026-10-25", callbacks)
 
     def test_parse_future_date(self):
         today = date(2026, 10, 26)
@@ -50,10 +70,18 @@ class BotParsingTests(unittest.TestCase):
 
 class TaskStoreTests(unittest.TestCase):
     def test_contains_only_current_task_date(self):
-        first = {"request_id": "abc", "date": "01.11.2026"}
-        second = {"request_id": "abc", "date": "02.11.2026"}
+        first = {
+            "request_id": "abc",
+            "origin": "MOW",
+            "dest": "AER",
+            "date": "01.11.2026",
+            "threshold": 15000,
+        }
+        second = {**first, "date": "02.11.2026"}
+        changed_route = {**first, "dest": "SCO"}
         self.assertTrue(contains_task([first], first))
         self.assertFalse(contains_task([first], second))
+        self.assertFalse(contains_task([first], changed_route))
 
     def test_add_group_and_delete_request(self):
         directory = Path(__file__).parent / f".tmp-{uuid.uuid4().hex}"
@@ -103,6 +131,36 @@ class TaskStoreTests(unittest.TestCase):
             task_store = TaskStore(path)
             self.assertEqual(task_store.requests_for_chat(123)[0]["request_id"], "legacy-0")
             self.assertEqual(task_store.delete_request(123, "legacy-0"), 1)
+        finally:
+            for child in directory.iterdir():
+                child.unlink()
+            directory.rmdir()
+
+    def test_update_route_dates_and_threshold(self):
+        directory = Path(__file__).parent / f".tmp-{uuid.uuid4().hex}"
+        directory.mkdir()
+        try:
+            task_store = TaskStore(directory / "tasks.json")
+            request_id = task_store.add_request(
+                chat_id=123,
+                origin="MOW",
+                dest="AER",
+                dates=[date(2026, 11, 1)],
+                threshold=15000,
+            )
+            self.assertTrue(
+                task_store.update_request(
+                    123,
+                    request_id,
+                    dest="SCO",
+                    dates=[date(2026, 12, 1), date(2026, 12, 2)],
+                    threshold=20000,
+                )
+            )
+            request = task_store.get_request(123, request_id)
+            self.assertEqual(request["dest"], "SCO")
+            self.assertEqual(request["threshold"], 20000)
+            self.assertEqual(request["dates"], ["01.12.2026", "02.12.2026"])
         finally:
             for child in directory.iterdir():
                 child.unlink()

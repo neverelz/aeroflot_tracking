@@ -34,7 +34,14 @@ def task_key(task: dict) -> tuple[str, ...]:
     """Возвращает устойчивый ключ одной даты заявки."""
     request_id = task.get("request_id")
     if request_id:
-        return ("request", str(request_id), str(task.get("date")))
+        return (
+            "request",
+            str(request_id),
+            str(task.get("origin")),
+            str(task.get("dest")),
+            str(task.get("date")),
+            str(task.get("threshold")),
+        )
     return (
         "legacy",
         str(task.get("chat_id")),
@@ -117,6 +124,68 @@ class TaskStore:
             item["dates"].append(str(task.get("date", "?")))
 
         return list(grouped.values())
+
+    def get_request(self, chat_id: int | str, request_id: str) -> dict | None:
+        for request in self.requests_for_chat(chat_id):
+            if request["request_id"] == request_id:
+                return request
+        return None
+
+    def update_request(
+        self,
+        chat_id: int | str,
+        request_id: str,
+        *,
+        origin: str | None = None,
+        dest: str | None = None,
+        dates: Iterable[date] | None = None,
+        threshold: int | None = None,
+    ) -> bool:
+        """Обновляет поля заявки, сохраняя её request_id."""
+        chat_id = str(chat_id)
+        with self._lock:
+            tasks = self._read_unlocked()
+            matching = [
+                task
+                for task in tasks
+                if str(task.get("chat_id")) == chat_id
+                and str(task.get("request_id")) == request_id
+            ]
+            if not matching:
+                return False
+
+            if dates is None:
+                for task in matching:
+                    if origin is not None:
+                        task["origin"] = origin
+                    if dest is not None:
+                        task["dest"] = dest
+                    if threshold is not None:
+                        task["threshold"] = threshold
+                self._write_unlocked(tasks)
+                return True
+
+            date_list = list(dates)
+            if not date_list:
+                raise ValueError("В заявке должна быть хотя бы одна дата.")
+
+            template = matching[0]
+            first_index = tasks.index(template)
+            remaining = [task for task in tasks if task not in matching]
+            replacement = [
+                {
+                    "request_id": request_id,
+                    "chat_id": chat_id,
+                    "origin": origin if origin is not None else template.get("origin"),
+                    "dest": dest if dest is not None else template.get("dest"),
+                    "date": flight_date.strftime("%d.%m.%Y"),
+                    "threshold": threshold if threshold is not None else template.get("threshold"),
+                }
+                for flight_date in date_list
+            ]
+            remaining[first_index:first_index] = replacement
+            self._write_unlocked(remaining)
+            return True
 
     def delete_request(self, chat_id: int | str, request_id: str) -> int:
         """Удаляет только заявку указанного пользователя."""

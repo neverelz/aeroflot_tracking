@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -20,6 +20,8 @@ from telegram.ext import (
     filters,
 )
 
+from airport_catalog import BY_CODE, Airport, find_airports
+from calendar_ui import build_calendar
 from task_store import MAX_RANGE_DAYS, TaskStore, dates_between
 
 
@@ -27,34 +29,19 @@ BASE_DIR = Path(__file__).parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR)))
 TASKS_FILE = DATA_DIR / "tasks.json"
 
-ORIGIN, DESTINATION, DATE_MODE, SINGLE_DATE, RANGE_START, RANGE_END, THRESHOLD, CONFIRM = range(8)
-
-# Для популярных городов используем основной аэропорт Аэрофлота. Любой другой
-# аэропорт можно указать его трёхбуквенным IATA-кодом.
-AIRPORTS = {
-    "москва": "SVO",
-    "санкт-петербург": "LED",
-    "санкт петербург": "LED",
-    "петербург": "LED",
-    "сочи": "AER",
-    "краснодар": "KRR",
-    "казань": "KZN",
-    "екатеринбург": "SVX",
-    "новосибирск": "OVB",
-    "калининград": "KGD",
-    "минеральные воды": "MRV",
-    "махачкала": "MCX",
-    "уфа": "UFA",
-    "самара": "KUF",
-    "владивосток": "VVO",
-    "хабаровск": "KHV",
-    "иркутск": "IKT",
-    "омск": "OMS",
-    "пермь": "PEE",
-    "мурманск": "MMK",
-    "архангельск": "ARH",
-    "волгоград": "VOG",
-}
+(
+    ORIGIN,
+    ORIGIN_SELECT,
+    DESTINATION,
+    DESTINATION_SELECT,
+    DATE_MODE,
+    SINGLE_DATE,
+    RANGE_START,
+    RANGE_END,
+    THRESHOLD,
+    CONFIRM,
+    EDIT_MENU,
+) = range(11)
 
 DATE_FORMAT = "%d.%m.%Y"
 logger = logging.getLogger(__name__)
@@ -81,10 +68,8 @@ CANCEL_MENU = ReplyKeyboardMarkup(
 
 
 def resolve_airport(value: str) -> str | None:
-    cleaned = " ".join(value.strip().lower().replace("ё", "е").split())
-    if re.fullmatch(r"[a-zA-Z]{3}", cleaned):
-        return cleaned.upper()
-    return AIRPORTS.get(cleaned)
+    matches = find_airports(value, limit=1)
+    return matches[0].code if matches else None
 
 
 def parse_future_date(value: str, *, today: date | None = None) -> date:
@@ -119,6 +104,43 @@ def format_dates(dates: list[date]) -> str:
     return f"{dates[0].strftime(DATE_FORMAT)} — {dates[-1].strftime(DATE_FORMAT)} ({len(dates)} дн.)"
 
 
+def airport_keyboard(airports: list[Airport], field: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(airport.label, callback_data=f"airport:{field}:{airport.code}")]]
+        for airport in airports
+    )
+
+
+def date_limits() -> tuple[date, date]:
+    today = date.today()
+    return today, today + timedelta(days=730)
+
+
+def calendar_markup(mode: str, month: date, *, start: date | None = None) -> InlineKeyboardMarkup:
+    minimum, maximum = date_limits()
+    if mode == "end" and start:
+        minimum = start
+        maximum = min(maximum, start + timedelta(days=MAX_RANGE_DAYS - 1))
+    return build_calendar(
+        mode,
+        month,
+        min_date=minimum,
+        max_date=maximum,
+        selected_start=start,
+    )
+
+
+def request_summary(item: dict) -> str:
+    threshold = item.get("threshold")
+    threshold_text = format_money(threshold) if isinstance(threshold, int) else "не указан"
+    return (
+        f"✈️ {item['origin']} → {item['dest']}\n"
+        f"📅 {_request_dates_text(item['dates'])}\n"
+        f"🎯 До {threshold_text} ₽\n"
+        f"Номер: #{item['request_id']}"
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     await update.message.reply_text(
@@ -132,7 +154,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "/new — создать заявку\n"
-        "/requests — посмотреть и удалить свои заявки\n"
+        "/requests — посмотреть, изменить или удалить свои заявки\n"
         "/airports — примеры городов и IATA-кодов\n"
         "/menu — показать главное меню\n"
         "/cancel — отменить заполнение\n"
@@ -143,8 +165,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def airports_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Можно написать название популярного города (например, Москва, Сочи, Казань) "
-        "или любой трёхбуквенный IATA-код аэропорта: SVO, LED, AER и т. п.",
+        "Напишите название города — бот предложит только доступные в каталоге "
+        "направлений Аэрофлота варианты и правильные IATA-коды. "
+        "Произвольные коды не принимаются.",
         reply_markup=MAIN_MENU,
     )
 
@@ -152,7 +175,7 @@ async def airports_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def new_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     query = update.callback_query
-    text = "Откуда летите? Напишите город или IATA-код аэропорта, например Москва или SVO."
+    text = "Откуда летите? Напишите название города, например Москва или Сочи."
     if query:
         await query.answer()
         await query.edit_message_reply_markup(reply_markup=None)
@@ -163,33 +186,50 @@ async def new_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
 
 async def receive_origin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    airport = resolve_airport(update.message.text)
-    if not airport:
+    airports = find_airports(update.message.text)
+    if not airports:
         await update.message.reply_text(
-            "Не смог определить аэропорт. Введите трёхбуквенный IATA-код, например SVO."
+            "Не нашёл такого направления в каталоге Аэрофлота. "
+            "Попробуйте название города, например Москва, Сочи или Актау."
         )
         return ORIGIN
-    context.user_data["origin"] = airport
     await update.message.reply_text(
-        f"Откуда: {airport}. Теперь напишите город или IATA-код аэропорта назначения."
+        "Выберите подходящий аэропорт:",
+        reply_markup=airport_keyboard(airports, "origin"),
     )
-    return DESTINATION
+    return ORIGIN_SELECT
 
 
-async def receive_destination(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    airport = resolve_airport(update.message.text)
+async def receive_airport_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    _, field, code = query.data.split(":", 2)
+    airport = BY_CODE.get(code)
     if not airport:
-        await update.message.reply_text(
-            "Не смог определить аэропорт. Введите трёхбуквенный IATA-код, например AER."
+        await query.answer()
+        await query.edit_message_text("Этот аэропорт больше недоступен. Начните заново: /new")
+        return ConversationHandler.END
+
+    if field == "origin":
+        await query.answer()
+        context.user_data["origin"] = code
+        await query.edit_message_text(f"Выбрано: {airport.label}")
+        await query.message.reply_text(
+            f"Откуда: {code}. Теперь напишите город назначения, например Сочи или Актау."
         )
         return DESTINATION
-    if airport == context.user_data["origin"]:
-        await update.message.reply_text("Аэропорты вылета и прилёта должны отличаться.")
-        return DESTINATION
 
-    context.user_data["dest"] = airport
-    await update.message.reply_text(
-        f"Маршрут: {context.user_data['origin']} → {airport}. Как искать?",
+    if code == context.user_data.get("origin"):
+        await query.answer("Аэропорты вылета и прилёта должны отличаться.", show_alert=True)
+        return DESTINATION_SELECT
+
+    await query.answer()
+    context.user_data["dest"] = code
+    await query.edit_message_text(f"Выбрано: {airport.label}")
+    if context.user_data.get("operation") == "edit_route":
+        return await save_request_edit(update, context, origin=context.user_data["origin"], dest=code)
+
+    await query.message.reply_text(
+        f"Маршрут: {context.user_data['origin']} → {code}. Как выбрать даты?",
         reply_markup=InlineKeyboardMarkup(
             [[
                 InlineKeyboardButton("Одна дата", callback_data="date_single"),
@@ -200,16 +240,81 @@ async def receive_destination(update: Update, context: ContextTypes.DEFAULT_TYPE
     return DATE_MODE
 
 
+async def receive_destination(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    airports = find_airports(update.message.text)
+    if not airports:
+        await update.message.reply_text(
+            "Не нашёл такого направления в каталоге Аэрофлота. "
+            "Попробуйте другое название города."
+        )
+        return DESTINATION
+    await update.message.reply_text(
+        "Выберите аэропорт назначения:",
+        reply_markup=airport_keyboard(airports, "dest"),
+    )
+    return DESTINATION_SELECT
+
+
 async def choose_date_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
+    today, _ = date_limits()
     if query.data == "date_single":
-        await query.edit_message_text("Введите дату вылета в формате ДД.ММ.ГГГГ.")
+        await query.edit_message_text(
+            "Выберите дату вылета:",
+            reply_markup=calendar_markup("single", today),
+        )
         return SINGLE_DATE
     await query.edit_message_text(
-        f"Введите первую дату диапазона в формате ДД.ММ.ГГГГ. Максимум — {MAX_RANGE_DAYS} дней."
+        f"Выберите первую дату диапазона (максимум {MAX_RANGE_DAYS} дней):",
+        reply_markup=calendar_markup("start", today),
     )
     return RANGE_START
+
+
+async def handle_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int | None:
+    query = update.callback_query
+    await query.answer()
+    parts = query.data.split(":")
+    action = parts[1]
+    if action == "noop":
+        return None
+
+    mode = parts[2]
+    states = {"single": SINGLE_DATE, "start": RANGE_START, "end": RANGE_END}
+    if action == "nav":
+        shown_month = datetime.strptime(parts[3], "%Y-%m").date()
+        await query.edit_message_reply_markup(
+            reply_markup=calendar_markup(
+                mode,
+                shown_month,
+                start=context.user_data.get("range_start"),
+            )
+        )
+        return states[mode]
+
+    selected = date.fromisoformat(parts[3])
+    if mode == "single":
+        context.user_data["dates"] = [selected]
+        await query.edit_message_text(f"Дата: {selected.strftime(DATE_FORMAT)}")
+        if context.user_data.get("operation") == "edit_dates":
+            return await save_request_edit(update, context, dates=[selected])
+        return await ask_threshold(update)
+
+    if mode == "start":
+        context.user_data["range_start"] = selected
+        await query.edit_message_text(
+            f"Начало: {selected.strftime(DATE_FORMAT)}. Выберите последнюю дату:",
+            reply_markup=calendar_markup("end", selected, start=selected),
+        )
+        return RANGE_END
+
+    selected_dates = dates_between(context.user_data["range_start"], selected)
+    context.user_data["dates"] = selected_dates
+    await query.edit_message_text(f"Даты: {format_dates(selected_dates)}")
+    if context.user_data.get("operation") == "edit_dates":
+        return await save_request_edit(update, context, dates=selected_dates)
+    return await ask_threshold(update)
 
 
 async def receive_single_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -219,6 +324,8 @@ async def receive_single_date(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(str(exc))
         return SINGLE_DATE
     context.user_data["dates"] = [flight_date]
+    if context.user_data.get("operation") == "edit_dates":
+        return await save_request_edit(update, context, dates=[flight_date])
     return await ask_threshold(update)
 
 
@@ -242,11 +349,13 @@ async def receive_range_end(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     except ValueError as exc:
         await update.message.reply_text(str(exc))
         return RANGE_END
+    if context.user_data.get("operation") == "edit_dates":
+        return await save_request_edit(update, context, dates=context.user_data["dates"])
     return await ask_threshold(update)
 
 
 async def ask_threshold(update: Update) -> int:
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         "При какой цене прислать уведомление? Введите сумму в рублях, например 15000."
     )
     return THRESHOLD
@@ -258,6 +367,13 @@ async def receive_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     except ValueError as exc:
         await update.message.reply_text(str(exc))
         return THRESHOLD
+
+    if context.user_data.get("operation") == "edit_threshold":
+        return await save_request_edit(
+            update,
+            context,
+            threshold=context.user_data["threshold"],
+        )
 
     await update.message.reply_text(
         "Проверьте заявку:\n\n"
@@ -307,6 +423,107 @@ async def confirm_request(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return ConversationHandler.END
 
 
+async def start_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    request_id = query.data.split(":", 1)[1]
+    try:
+        item = store.get_request(update.effective_chat.id, request_id)
+    except RuntimeError:
+        logger.exception("Не удалось загрузить заявку %s", request_id)
+        await query.edit_message_text("Не удалось загрузить заявку. Попробуйте позже.")
+        return ConversationHandler.END
+    if not item:
+        await query.edit_message_text("Заявка уже удалена или вам не принадлежит.")
+        return ConversationHandler.END
+
+    context.user_data.clear()
+    context.user_data["editing_request_id"] = request_id
+    await query.edit_message_text(
+        f"Что изменить?\n\n{request_summary(item)}",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("✈️ Маршрут", callback_data="editfield:route"),
+                    InlineKeyboardButton("📅 Даты", callback_data="editfield:dates"),
+                ],
+                [InlineKeyboardButton("🎯 Порог цены", callback_data="editfield:threshold")],
+                [InlineKeyboardButton("Закрыть", callback_data="edit_cancel")],
+            ]
+        ),
+    )
+    return EDIT_MENU
+
+
+async def choose_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    field = query.data.split(":", 1)[1]
+    if field == "route":
+        context.user_data["operation"] = "edit_route"
+        await query.edit_message_text("Изменение маршрута")
+        await query.message.reply_text(
+            "Напишите новый город вылета.",
+            reply_markup=CANCEL_MENU,
+        )
+        return ORIGIN
+    if field == "dates":
+        context.user_data["operation"] = "edit_dates"
+        await query.edit_message_text(
+            "Как выбрать новые даты?",
+            reply_markup=InlineKeyboardMarkup(
+                [[
+                    InlineKeyboardButton("Одна дата", callback_data="date_single"),
+                    InlineKeyboardButton("Диапазон дат", callback_data="date_range"),
+                ]]
+            ),
+        )
+        return DATE_MODE
+
+    context.user_data["operation"] = "edit_threshold"
+    await query.edit_message_text("Изменение порога цены")
+    await query.message.reply_text(
+        "Введите новый порог в рублях, например 15000.",
+        reply_markup=CANCEL_MENU,
+    )
+    return THRESHOLD
+
+
+async def save_request_edit(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    **changes,
+) -> int:
+    request_id = context.user_data.get("editing_request_id")
+    try:
+        updated = bool(request_id) and store.update_request(
+            update.effective_chat.id,
+            request_id,
+            **changes,
+        )
+    except (OSError, RuntimeError, ValueError):
+        logger.exception("Не удалось изменить заявку %s", request_id)
+        updated = False
+
+    context.user_data.clear()
+    text = (
+        f"✅ Заявка #{request_id} обновлена."
+        if updated
+        else "Не удалось обновить заявку: возможно, она уже удалена."
+    )
+    await update.effective_message.reply_text(text, reply_markup=MAIN_MENU)
+    return ConversationHandler.END
+
+
+async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    context.user_data.clear()
+    await query.edit_message_text("Действие отменено.")
+    await query.message.reply_text("Главное меню:", reply_markup=MAIN_MENU)
+    return ConversationHandler.END
+
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     await update.message.reply_text(
@@ -349,15 +566,19 @@ async def list_requests(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     await update.message.reply_text(f"Ваши заявки: {len(requests)}", reply_markup=MAIN_MENU)
     for item in requests:
-        threshold = item.get("threshold")
-        threshold_text = format_money(threshold) if isinstance(threshold, int) else "не указан"
         await update.message.reply_text(
-            f"✈️ {item['origin']} → {item['dest']}\n"
-            f"📅 {_request_dates_text(item['dates'])}\n"
-            f"🎯 До {threshold_text} ₽\n"
-            f"Номер: #{item['request_id']}",
+            request_summary(item),
             reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("🗑 Удалить", callback_data=f"delete:{item['request_id']}")]]
+                [[
+                    InlineKeyboardButton(
+                        "✏️ Изменить",
+                        callback_data=f"edit:{item['request_id']}",
+                    ),
+                    InlineKeyboardButton(
+                        "🗑 Удалить",
+                        callback_data=f"delete:{item['request_id']}",
+                    ),
+                ]]
             ),
         )
 
@@ -393,22 +614,40 @@ def build_application(token: str) -> Application:
             CommandHandler("new", new_request),
             MessageHandler(filters.Regex(f"^{re.escape(BUTTON_NEW)}$"), new_request),
             CallbackQueryHandler(new_request, pattern="^new_request$"),
+            CallbackQueryHandler(start_edit, pattern=r"^edit:[a-zA-Z0-9-]+$"),
         ],
         states={
             ORIGIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_origin)],
+            ORIGIN_SELECT: [
+                CallbackQueryHandler(receive_airport_selection, pattern=r"^airport:origin:[A-Z]{3}$")
+            ],
             DESTINATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_destination)],
+            DESTINATION_SELECT: [
+                CallbackQueryHandler(receive_airport_selection, pattern=r"^airport:dest:[A-Z]{3}$")
+            ],
             DATE_MODE: [CallbackQueryHandler(choose_date_mode, pattern="^date_(single|range)$")],
-            SINGLE_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_single_date)],
-            RANGE_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_range_start)],
-            RANGE_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_range_end)],
+            SINGLE_DATE: [
+                CallbackQueryHandler(handle_calendar, pattern=r"^cal:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_single_date),
+            ],
+            RANGE_START: [
+                CallbackQueryHandler(handle_calendar, pattern=r"^cal:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_range_start),
+            ],
+            RANGE_END: [
+                CallbackQueryHandler(handle_calendar, pattern=r"^cal:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_range_end),
+            ],
             THRESHOLD: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_threshold)],
             CONFIRM: [CallbackQueryHandler(confirm_request, pattern="^confirm_(save|cancel)$")],
+            EDIT_MENU: [CallbackQueryHandler(choose_edit_field, pattern=r"^editfield:")],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
             CommandHandler("start", start),
             CommandHandler("menu", start),
             MessageHandler(filters.Regex(f"^{re.escape(BUTTON_CANCEL)}$"), cancel),
+            CallbackQueryHandler(cancel_callback, pattern=r"^(confirm_cancel|edit_cancel)$"),
         ],
         allow_reentry=True,
     )
