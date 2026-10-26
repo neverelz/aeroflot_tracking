@@ -16,6 +16,9 @@ services:
     restart: unless-stopped
 
   tracker:
+    build:
+      context: .
+      dockerfile: Dockerfile
     image: aeroflot-tracking:local
     command: ["python", "tracker.py"]
     env_file:
