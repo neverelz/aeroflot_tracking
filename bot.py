@@ -177,8 +177,8 @@ async def new_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     context.user_data.clear()
     query = update.callback_query
     text = (
-        "Откуда летите? Начните вводить название города, например Моск, Москва или Сочи. "
-        "Я предложу доступные варианты с IATA-кодами."
+        "Откуда летите? Напишите название города, например Москва или Сочи. "
+        "Я предложу доступные варианты."
     )
     if query:
         await query.answer()
@@ -194,7 +194,7 @@ async def receive_origin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not airports:
         await update.message.reply_text(
             "Не нашёл такого направления в каталоге Аэрофлота. "
-            "Проверьте написание или введите начало названия, например Моск, Сочи или Акт."
+            "Проверьте написание или введите начало названия, например Москва или Сочи."
         )
         return ORIGIN
     await update.message.reply_text(
@@ -219,7 +219,7 @@ async def receive_airport_selection(update: Update, context: ContextTypes.DEFAUL
         await query.edit_message_text(f"Выбрано: {airport.label}")
         await query.message.reply_text(
             f"Откуда: {airport.city} ({code}). Теперь начните вводить город назначения, "
-            "например Соч или Актау. Я предложу варианты с IATA-кодами."
+            "например Сочи или Краснодар. Я предложу варианты."
         )
         return DESTINATION
 
