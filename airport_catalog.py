@@ -88,6 +88,14 @@ def _search_terms(airport: Airport) -> tuple[str, ...]:
     return tuple(normalize(value) for value in (airport.city, airport.name, *airport.aliases))
 
 
+# Явный словарь нужен для подсказок по городам. Несколько кодов у одного города
+# сохраняются в порядке каталога: например, для Москвы сначала MOW, затем SVO.
+CITY_TO_AIRPORTS: dict[str, tuple[Airport, ...]] = {}
+for _airport in AIRPORTS:
+    _city_key = normalize(_airport.city)
+    CITY_TO_AIRPORTS[_city_key] = (*CITY_TO_AIRPORTS.get(_city_key, ()), _airport)
+
+
 def find_airports(query: str, limit: int = 8) -> list[Airport]:
     """Ищет аэропорты по IATA-коду, городу, названию и псевдонимам."""
     normalized = normalize(query)
@@ -97,6 +105,19 @@ def find_airports(query: str, limit: int = 8) -> list[Airport]:
     code_match = BY_CODE.get(normalized.upper())
     if code_match:
         return [code_match]
+
+    city_match = CITY_TO_AIRPORTS.get(normalized)
+    if city_match:
+        return list(city_match[:limit])
+
+    city_prefix = [
+        airport
+        for city, airports in CITY_TO_AIRPORTS.items()
+        if city.startswith(normalized)
+        for airport in airports
+    ]
+    if city_prefix:
+        return city_prefix[:limit]
 
     exact = [airport for airport in AIRPORTS if normalized in _search_terms(airport)]
     if exact:

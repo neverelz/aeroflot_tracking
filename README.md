@@ -33,13 +33,15 @@ CHECK_INTERVAL=3
 
 ### Docker Compose
 
-Для запуска всего проекта нужен только Docker Desktop. Создайте `.env` из примера, укажите `TE LEGRAM_BOT_TOKEN`, затем выполните:
+Для запуска всего проекта нужен Docker с Compose. Создайте `.env` из примера, укажите `TELEGRAM_BOT_TOKEN`, затем выполните:
 
 ```powershell
 docker compose up --build -d
 ```
 
 Команда поднимет два контейнера: `bot` принимает заявки, а `tracker` проверяет цены в headless Chromium. Оба контейнера автоматически перезапускаются и используют общий каталог `data/`.
+
+Образ собирается на базе `python:3.10-slim-bookworm`; Chromium устанавливается из репозитория Debian. Доступ к `mcr.microsoft.com` и скачивание браузера через Playwright CDN не требуются.
 
 Полезные команды:
 

@@ -11,6 +11,7 @@ from bot import (
     BUTTON_NEW,
     BUTTON_REQUESTS,
     MAIN_MENU,
+    airport_keyboard,
     parse_future_date,
     parse_threshold,
     resolve_airport,
@@ -38,6 +39,22 @@ class BotParsingTests(unittest.TestCase):
             ["MOW", "SVO"],
         )
         self.assertEqual(find_airports("KRD"), [])
+
+    def test_city_prefix_returns_city_suggestions(self):
+        self.assertEqual(
+            [airport.code for airport in find_airports("Моск")],
+            ["MOW", "SVO"],
+        )
+        self.assertEqual(
+            [airport.code for airport in find_airports("Санкт")],
+            ["LED"],
+        )
+
+    def test_airport_keyboard_contains_rows_of_buttons(self):
+        markup = airport_keyboard(find_airports("Москва"), "origin")
+        self.assertEqual(len(markup.inline_keyboard), 2)
+        self.assertEqual(markup.inline_keyboard[0][0].callback_data, "airport:origin:MOW")
+        self.assertEqual(markup.inline_keyboard[1][0].callback_data, "airport:origin:SVO")
 
     def test_calendar_disables_dates_outside_period(self):
         markup = build_calendar(

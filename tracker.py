@@ -31,6 +31,7 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHECK_INTERVAL     = int(os.getenv("CHECK_INTERVAL", "3"))
 HEADLESS           = os.getenv("HEADLESS", "false").strip().lower() in {"1", "true", "yes", "on"}
+CHROMIUM_EXECUTABLE_PATH = os.getenv("CHROMIUM_EXECUTABLE_PATH", "").strip()
 
 BASE_DIR = Path(__file__).parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR)))
@@ -271,11 +272,15 @@ async def run_all_tasks(is_test: bool = False) -> None:
     log.info(f"=== Запуск цикла проверок. Задач в очереди: {len(tasks)} ===")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=HEADLESS,
-            slow_mo=300,
-            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
-        )
+        launch_options = {
+            "headless": HEADLESS,
+            "slow_mo": 300,
+            "args": ["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+        }
+        if CHROMIUM_EXECUTABLE_PATH:
+            launch_options["executable_path"] = CHROMIUM_EXECUTABLE_PATH
+
+        browser = await p.chromium.launch(**launch_options)
 
         context = await browser.new_context(
             viewport={"width": 1366, "height": 768},

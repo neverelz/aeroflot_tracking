@@ -105,10 +105,11 @@ def format_dates(dates: list[date]) -> str:
 
 
 def airport_keyboard(airports: list[Airport], field: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(airport.label, callback_data=f"airport:{field}:{airport.code}")]]
+    rows = [
+        [InlineKeyboardButton(airport.label, callback_data=f"airport:{field}:{airport.code}")]
         for airport in airports
-    )
+    ]
+    return InlineKeyboardMarkup(rows)
 
 
 def date_limits() -> tuple[date, date]:
@@ -175,7 +176,10 @@ async def airports_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def new_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     query = update.callback_query
-    text = "Откуда летите? Напишите название города, например Москва или Сочи."
+    text = (
+        "Откуда летите? Начните вводить название города, например Моск, Москва или Сочи. "
+        "Я предложу доступные варианты с IATA-кодами."
+    )
     if query:
         await query.answer()
         await query.edit_message_reply_markup(reply_markup=None)
@@ -190,7 +194,7 @@ async def receive_origin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not airports:
         await update.message.reply_text(
             "Не нашёл такого направления в каталоге Аэрофлота. "
-            "Попробуйте название города, например Москва, Сочи или Актау."
+            "Проверьте написание или введите начало названия, например Моск, Сочи или Акт."
         )
         return ORIGIN
     await update.message.reply_text(
@@ -214,7 +218,8 @@ async def receive_airport_selection(update: Update, context: ContextTypes.DEFAUL
         context.user_data["origin"] = code
         await query.edit_message_text(f"Выбрано: {airport.label}")
         await query.message.reply_text(
-            f"Откуда: {code}. Теперь напишите город назначения, например Сочи или Актау."
+            f"Откуда: {airport.city} ({code}). Теперь начните вводить город назначения, "
+            "например Соч или Актау. Я предложу варианты с IATA-кодами."
         )
         return DESTINATION
 
@@ -245,7 +250,7 @@ async def receive_destination(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not airports:
         await update.message.reply_text(
             "Не нашёл такого направления в каталоге Аэрофлота. "
-            "Попробуйте другое название города."
+            "Проверьте написание или введите начало названия города."
         )
         return DESTINATION
     await update.message.reply_text(
@@ -605,6 +610,15 @@ async def delete_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Ошибка при обработке Telegram-события", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "Не удалось обработать сообщение. Попробуйте отправить его ещё раз "
+                "или нажмите «Отменить».",
+                reply_markup=CANCEL_MENU,
+            )
+        except Exception:
+            logger.exception("Не удалось сообщить пользователю об ошибке")
 
 
 def build_application(token: str) -> Application:
