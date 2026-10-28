@@ -5,6 +5,12 @@
     "origin": "SVO",
     "dest": "AER",
     "date": "14.08.2027",
-    "threshold": 15000
+    "threshold": 15000,
+    "max_stops": 1,
+    "connection_mode": "comfortable",
+    "min_connection_minutes": 90,
+    "max_connection_minutes": 300,
+    "avoid_overnight": true,
+    "allow_airport_change": false
   }
 ]

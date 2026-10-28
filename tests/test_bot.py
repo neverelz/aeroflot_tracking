@@ -1,8 +1,10 @@
 import json
 import unittest
 import uuid
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
+
+from telegram import Chat, Message, Update, User
 
 from airport_catalog import find_airports
 from bot import (
@@ -11,7 +13,9 @@ from bot import (
     BUTTON_NEW,
     BUTTON_REQUESTS,
     MAIN_MENU,
+    TEXT_INPUT,
     airport_keyboard,
+    parse_connection_duration,
     parse_future_date,
     parse_threshold,
     resolve_airport,
@@ -21,6 +25,19 @@ from task_store import TaskStore, contains_task, dates_between
 
 
 class BotParsingTests(unittest.TestCase):
+    @staticmethod
+    def text_update(text: str) -> Update:
+        return Update(
+            1,
+            message=Message(
+                1,
+                datetime.now(timezone.utc),
+                Chat(1, "private"),
+                from_user=User(1, "Test", False),
+                text=text,
+            ),
+        )
+
     def test_main_menu_contains_all_actions(self):
         labels = [[button.text for button in row] for row in MAIN_MENU.keyboard]
         self.assertEqual(
@@ -56,6 +73,10 @@ class BotParsingTests(unittest.TestCase):
         self.assertEqual(markup.inline_keyboard[0][0].callback_data, "airport:origin:MOW")
         self.assertEqual(markup.inline_keyboard[1][0].callback_data, "airport:origin:SVO")
 
+    def test_cancel_button_is_not_consumed_as_text_input(self):
+        self.assertFalse(TEXT_INPUT.check_update(self.text_update("❌ Отменить")))
+        self.assertTrue(TEXT_INPUT.check_update(self.text_update("Москва")))
+
     def test_calendar_disables_dates_outside_period(self):
         markup = build_calendar(
             "single",
@@ -77,6 +98,13 @@ class BotParsingTests(unittest.TestCase):
         self.assertEqual(parse_threshold("15 000 ₽"), 15000)
         with self.assertRaises(ValueError):
             parse_threshold("дорого")
+
+    def test_parse_connection_duration(self):
+        self.assertEqual(parse_connection_duration("90"), 90)
+        self.assertEqual(parse_connection_duration("1:30"), 90)
+        self.assertEqual(parse_connection_duration("2 ч 15 мин"), 135)
+        with self.assertRaises(ValueError):
+            parse_connection_duration("25:00")
 
     def test_date_range_is_inclusive_and_limited(self):
         result = dates_between(date(2026, 11, 1), date(2026, 11, 3))
@@ -117,6 +145,7 @@ class TaskStoreTests(unittest.TestCase):
             raw = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(len(raw), 2)
             self.assertTrue(all(item["request_id"] == request_id for item in raw))
+            self.assertTrue(all(item["max_stops"] == 0 for item in raw))
             self.assertEqual(task_store.requests_for_chat(123)[0]["dates"], ["01.11.2026", "02.11.2026"])
             self.assertEqual(task_store.requests_for_chat(999), [])
 
@@ -178,6 +207,21 @@ class TaskStoreTests(unittest.TestCase):
             self.assertEqual(request["dest"], "SCO")
             self.assertEqual(request["threshold"], 20000)
             self.assertEqual(request["dates"], ["01.12.2026", "02.12.2026"])
+
+            self.assertTrue(
+                task_store.update_request(
+                    123,
+                    request_id,
+                    max_stops=2,
+                    connection_mode="comfortable",
+                    min_connection_minutes=90,
+                    max_connection_minutes=300,
+                )
+            )
+            request = task_store.get_request(123, request_id)
+            self.assertEqual(request["max_stops"], 2)
+            self.assertEqual(request["min_connection_minutes"], 90)
+            self.assertEqual(request["max_connection_minutes"], 300)
         finally:
             for child in directory.iterdir():
                 child.unlink()

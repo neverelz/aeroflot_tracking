@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import warnings
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -19,9 +20,11 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.warnings import PTBUserWarning
 
 from airport_catalog import BY_CODE, Airport, find_airports
 from calendar_ui import build_calendar
+from itinerary import minutes_text
 from task_store import MAX_RANGE_DAYS, TaskStore, dates_between
 
 
@@ -38,10 +41,14 @@ TASKS_FILE = DATA_DIR / "tasks.json"
     SINGLE_DATE,
     RANGE_START,
     RANGE_END,
+    MAX_STOPS,
+    CONNECTION_MODE,
+    CONNECTION_MIN,
+    CONNECTION_MAX,
     THRESHOLD,
     CONFIRM,
     EDIT_MENU,
-) = range(11)
+) = range(15)
 
 DATE_FORMAT = "%d.%m.%Y"
 logger = logging.getLogger(__name__)
@@ -52,6 +59,23 @@ BUTTON_REQUESTS = "📋 Мои заявки"
 BUTTON_AIRPORTS = "🛫 Аэропорты"
 BUTTON_HELP = "ℹ️ Помощь"
 BUTTON_CANCEL = "❌ Отменить"
+
+# Кнопка отмены является обычным текстовым сообщением. Исключаем её из полей
+# ввода, чтобы ConversationHandler передал сообщение в fallback `cancel`.
+TEXT_INPUT = (
+    filters.TEXT
+    & ~filters.COMMAND
+    & ~filters.Regex(f"^{re.escape(BUTTON_CANCEL)}$")
+)
+
+# Диалог намеренно чередует обычные сообщения и inline-кнопки и должен
+# отслеживаться на уровне пользователя/чата. Предупреждение per_message для
+# такого смешанного сценария не означает ошибку и только засоряет лог.
+warnings.filterwarnings(
+    "ignore",
+    message=r"If 'per_message=False', 'CallbackQueryHandler' will not be tracked for every message\..*",
+    category=PTBUserWarning,
+)
 
 MAIN_MENU = ReplyKeyboardMarkup(
     [[BUTTON_NEW, BUTTON_REQUESTS], [BUTTON_AIRPORTS, BUTTON_HELP]],
@@ -104,6 +128,43 @@ def format_dates(dates: list[date]) -> str:
     return f"{dates[0].strftime(DATE_FORMAT)} — {dates[-1].strftime(DATE_FORMAT)} ({len(dates)} дн.)"
 
 
+def parse_connection_duration(value: str) -> int:
+    """Разбирает минуты, Ч:ММ или запись вида «2 ч 30 мин»."""
+    normalized = value.strip().lower().replace(",", ".")
+    colon_match = re.fullmatch(r"(\d{1,2}):([0-5]\d)", normalized)
+    if colon_match:
+        minutes = int(colon_match.group(1)) * 60 + int(colon_match.group(2))
+    else:
+        text_match = re.fullmatch(
+            r"(?:(\d+(?:\.\d+)?)\s*(?:ч|час(?:а|ов)?))?\s*"
+            r"(?:(\d+)\s*(?:м|мин(?:ут[аы]?)?))?",
+            normalized,
+        )
+        if text_match and any(text_match.groups()):
+            minutes = round(float(text_match.group(1) or 0) * 60) + int(text_match.group(2) or 0)
+        elif normalized.isdigit():
+            minutes = int(normalized)
+        else:
+            raise ValueError("Введите время в минутах или как Ч:ММ, например 90 или 1:30.")
+    if not 0 <= minutes <= 1440:
+        raise ValueError("Стыковка должна быть не дольше 24 часов.")
+    return minutes
+
+
+def connections_text(item: dict) -> str:
+    max_stops = int(item.get("max_stops", 0) or 0)
+    if max_stops == 0:
+        return "только прямые рейсы"
+    minimum = item.get("min_connection_minutes")
+    maximum = item.get("max_connection_minutes")
+    if isinstance(minimum, int) and isinstance(maximum, int):
+        return (
+            f"до {max_stops} пересадок, стыковка "
+            f"{minutes_text(minimum)}–{minutes_text(maximum)}"
+        )
+    return f"до {max_stops} пересадок"
+
+
 def airport_keyboard(airports: list[Airport], field: str) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(airport.label, callback_data=f"airport:{field}:{airport.code}")]
@@ -137,6 +198,7 @@ def request_summary(item: dict) -> str:
     return (
         f"✈️ {item['origin']} → {item['dest']}\n"
         f"📅 {_request_dates_text(item['dates'])}\n"
+        f"🔄 {connections_text(item)}\n"
         f"🎯 До {threshold_text} ₽\n"
         f"Номер: #{item['request_id']}"
     )
@@ -304,7 +366,7 @@ async def handle_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_text(f"Дата: {selected.strftime(DATE_FORMAT)}")
         if context.user_data.get("operation") == "edit_dates":
             return await save_request_edit(update, context, dates=[selected])
-        return await ask_threshold(update)
+        return await ask_max_stops(update)
 
     if mode == "start":
         context.user_data["range_start"] = selected
@@ -319,7 +381,7 @@ async def handle_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.edit_message_text(f"Даты: {format_dates(selected_dates)}")
     if context.user_data.get("operation") == "edit_dates":
         return await save_request_edit(update, context, dates=selected_dates)
-    return await ask_threshold(update)
+    return await ask_max_stops(update)
 
 
 async def receive_single_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -331,7 +393,7 @@ async def receive_single_date(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data["dates"] = [flight_date]
     if context.user_data.get("operation") == "edit_dates":
         return await save_request_edit(update, context, dates=[flight_date])
-    return await ask_threshold(update)
+    return await ask_max_stops(update)
 
 
 async def receive_range_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -356,6 +418,124 @@ async def receive_range_end(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return RANGE_END
     if context.user_data.get("operation") == "edit_dates":
         return await save_request_edit(update, context, dates=context.user_data["dates"])
+    return await ask_max_stops(update)
+
+
+async def ask_max_stops(update: Update) -> int:
+    await update.effective_message.reply_text(
+        "Сколько пересадок максимально допустимо?\n"
+        "Промежуточные города программа подберёт автоматически.",
+        reply_markup=InlineKeyboardMarkup(
+            [[
+                InlineKeyboardButton("Только прямые", callback_data="stops:0"),
+                InlineKeyboardButton("До 1", callback_data="stops:1"),
+                InlineKeyboardButton("До 2", callback_data="stops:2"),
+            ]]
+        ),
+    )
+    return MAX_STOPS
+
+
+async def choose_max_stops(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    max_stops = int(query.data.split(":", 1)[1])
+    context.user_data["max_stops"] = max_stops
+    if max_stops == 0:
+        context.user_data.update(
+            connection_mode="direct",
+            min_connection_minutes=None,
+            max_connection_minutes=None,
+        )
+        await query.edit_message_text("Пересадки: только прямые рейсы.")
+        return await finish_connection_settings(update, context)
+
+    await query.edit_message_text(
+        "Какие стыковки считать подходящими?",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton(
+                    "Удобные: 1:30–5:00",
+                    callback_data="connection:comfortable",
+                )],
+                [InlineKeyboardButton(
+                    "Любые варианты до 12 часов",
+                    callback_data="connection:flexible",
+                )],
+                [InlineKeyboardButton(
+                    "Настроить время",
+                    callback_data="connection:custom",
+                )],
+            ]
+        ),
+    )
+    return CONNECTION_MODE
+
+
+async def choose_connection_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    mode = query.data.split(":", 1)[1]
+    context.user_data["connection_mode"] = mode
+    if mode == "comfortable":
+        context.user_data["min_connection_minutes"] = 90
+        context.user_data["max_connection_minutes"] = 300
+        await query.edit_message_text("Стыковки: удобные, от 1 ч 30 мин до 5 ч.")
+        return await finish_connection_settings(update, context)
+    if mode == "flexible":
+        context.user_data["min_connection_minutes"] = 0
+        context.user_data["max_connection_minutes"] = 720
+        await query.edit_message_text("Стыковки: любые варианты Аэрофлота до 12 ч.")
+        return await finish_connection_settings(update, context)
+
+    await query.edit_message_text("Настройка времени стыковки.")
+    await query.message.reply_text(
+        "Введите минимальное время стыковки в минутах или как Ч:ММ, например 90 или 1:30.",
+        reply_markup=CANCEL_MENU,
+    )
+    return CONNECTION_MIN
+
+
+async def receive_connection_min(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        minimum = parse_connection_duration(update.message.text)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return CONNECTION_MIN
+    context.user_data["min_connection_minutes"] = minimum
+    await update.message.reply_text(
+        f"Минимум: {minutes_text(minimum)}. Теперь введите максимальное время, например 5:00."
+    )
+    return CONNECTION_MAX
+
+
+async def receive_connection_max(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        maximum = parse_connection_duration(update.message.text)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return CONNECTION_MAX
+    minimum = context.user_data["min_connection_minutes"]
+    if maximum < minimum:
+        await update.message.reply_text("Максимальное время не может быть меньше минимального.")
+        return CONNECTION_MAX
+    context.user_data["max_connection_minutes"] = maximum
+    await update.message.reply_text(
+        f"Стыковки: от {minutes_text(minimum)} до {minutes_text(maximum)}."
+    )
+    return await finish_connection_settings(update, context)
+
+
+async def finish_connection_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if context.user_data.get("operation") == "edit_connections":
+        return await save_request_edit(
+            update,
+            context,
+            max_stops=context.user_data["max_stops"],
+            connection_mode=context.user_data["connection_mode"],
+            min_connection_minutes=context.user_data.get("min_connection_minutes"),
+            max_connection_minutes=context.user_data.get("max_connection_minutes"),
+        )
     return await ask_threshold(update)
 
 
@@ -384,6 +564,7 @@ async def receive_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         "Проверьте заявку:\n\n"
         f"✈️ {context.user_data['origin']} → {context.user_data['dest']}\n"
         f"📅 {format_dates(context.user_data['dates'])}\n"
+        f"🔄 {connections_text(context.user_data)}\n"
         f"🎯 Цена до {format_money(context.user_data['threshold'])} ₽",
         reply_markup=InlineKeyboardMarkup(
             [[
@@ -411,6 +592,10 @@ async def confirm_request(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             dest=context.user_data["dest"],
             dates=context.user_data["dates"],
             threshold=context.user_data["threshold"],
+            max_stops=context.user_data["max_stops"],
+            connection_mode=context.user_data["connection_mode"],
+            min_connection_minutes=context.user_data.get("min_connection_minutes"),
+            max_connection_minutes=context.user_data.get("max_connection_minutes"),
         )
     except (OSError, RuntimeError, ValueError):
         logger.exception("Не удалось сохранить заявку")
@@ -452,7 +637,10 @@ async def start_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                     InlineKeyboardButton("✈️ Маршрут", callback_data="editfield:route"),
                     InlineKeyboardButton("📅 Даты", callback_data="editfield:dates"),
                 ],
-                [InlineKeyboardButton("🎯 Порог цены", callback_data="editfield:threshold")],
+                [
+                    InlineKeyboardButton("🔄 Пересадки", callback_data="editfield:connections"),
+                    InlineKeyboardButton("🎯 Порог цены", callback_data="editfield:threshold"),
+                ],
                 [InlineKeyboardButton("Закрыть", callback_data="edit_cancel")],
             ]
         ),
@@ -484,6 +672,11 @@ async def choose_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             ),
         )
         return DATE_MODE
+
+    if field == "connections":
+        context.user_data["operation"] = "edit_connections"
+        await query.edit_message_text("Изменение настроек пересадок")
+        return await ask_max_stops(update)
 
     context.user_data["operation"] = "edit_threshold"
     await query.edit_message_text("Изменение порога цены")
@@ -631,28 +824,37 @@ def build_application(token: str) -> Application:
             CallbackQueryHandler(start_edit, pattern=r"^edit:[a-zA-Z0-9-]+$"),
         ],
         states={
-            ORIGIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_origin)],
+            ORIGIN: [MessageHandler(TEXT_INPUT, receive_origin)],
             ORIGIN_SELECT: [
                 CallbackQueryHandler(receive_airport_selection, pattern=r"^airport:origin:[A-Z]{3}$")
             ],
-            DESTINATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_destination)],
+            DESTINATION: [MessageHandler(TEXT_INPUT, receive_destination)],
             DESTINATION_SELECT: [
                 CallbackQueryHandler(receive_airport_selection, pattern=r"^airport:dest:[A-Z]{3}$")
             ],
             DATE_MODE: [CallbackQueryHandler(choose_date_mode, pattern="^date_(single|range)$")],
             SINGLE_DATE: [
                 CallbackQueryHandler(handle_calendar, pattern=r"^cal:"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_single_date),
+                MessageHandler(TEXT_INPUT, receive_single_date),
             ],
             RANGE_START: [
                 CallbackQueryHandler(handle_calendar, pattern=r"^cal:"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_range_start),
+                MessageHandler(TEXT_INPUT, receive_range_start),
             ],
             RANGE_END: [
                 CallbackQueryHandler(handle_calendar, pattern=r"^cal:"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_range_end),
+                MessageHandler(TEXT_INPUT, receive_range_end),
             ],
-            THRESHOLD: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_threshold)],
+            MAX_STOPS: [CallbackQueryHandler(choose_max_stops, pattern=r"^stops:[012]$")],
+            CONNECTION_MODE: [
+                CallbackQueryHandler(
+                    choose_connection_mode,
+                    pattern=r"^connection:(comfortable|flexible|custom)$",
+                )
+            ],
+            CONNECTION_MIN: [MessageHandler(TEXT_INPUT, receive_connection_min)],
+            CONNECTION_MAX: [MessageHandler(TEXT_INPUT, receive_connection_max)],
+            THRESHOLD: [MessageHandler(TEXT_INPUT, receive_threshold)],
             CONFIRM: [CallbackQueryHandler(confirm_request, pattern="^confirm_(save|cancel)$")],
             EDIT_MENU: [CallbackQueryHandler(choose_edit_field, pattern=r"^editfield:")],
         },

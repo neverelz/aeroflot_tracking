@@ -16,6 +16,42 @@ from typing import Iterable
 
 
 MAX_RANGE_DAYS = 31
+DEFAULT_MAX_STOPS = 0
+DEFAULT_CONNECTION_MODE = "direct"
+
+
+def normalize_connection_settings(
+    max_stops: int = DEFAULT_MAX_STOPS,
+    connection_mode: str = DEFAULT_CONNECTION_MODE,
+    min_connection_minutes: int | None = None,
+    max_connection_minutes: int | None = None,
+) -> dict:
+    """Проверяет и нормализует настройки пересадок для хранения в заявке."""
+    if max_stops not in {0, 1, 2}:
+        raise ValueError("Допустимо не более двух пересадок.")
+    if max_stops == 0:
+        return {
+            "max_stops": 0,
+            "connection_mode": "direct",
+            "min_connection_minutes": None,
+            "max_connection_minutes": None,
+            "avoid_overnight": True,
+            "allow_airport_change": False,
+        }
+    if connection_mode not in {"comfortable", "flexible", "custom"}:
+        raise ValueError("Неизвестный режим стыковки.")
+    if min_connection_minutes is None or max_connection_minutes is None:
+        raise ValueError("Укажите минимальное и максимальное время стыковки.")
+    if not 0 <= min_connection_minutes <= max_connection_minutes <= 1440:
+        raise ValueError("Время стыковки должно быть от 0 до 24 часов.")
+    return {
+        "max_stops": max_stops,
+        "connection_mode": connection_mode,
+        "min_connection_minutes": min_connection_minutes,
+        "max_connection_minutes": max_connection_minutes,
+        "avoid_overnight": True,
+        "allow_airport_change": False,
+    }
 
 
 def dates_between(start: date, end: date) -> list[date]:
@@ -41,6 +77,12 @@ def task_key(task: dict) -> tuple[str, ...]:
             str(task.get("dest")),
             str(task.get("date")),
             str(task.get("threshold")),
+            str(task.get("max_stops", DEFAULT_MAX_STOPS)),
+            str(task.get("connection_mode", DEFAULT_CONNECTION_MODE)),
+            str(task.get("min_connection_minutes")),
+            str(task.get("max_connection_minutes")),
+            str(task.get("avoid_overnight", True)),
+            str(task.get("allow_airport_change", False)),
         )
     return (
         "legacy",
@@ -49,6 +91,12 @@ def task_key(task: dict) -> tuple[str, ...]:
         str(task.get("dest")),
         str(task.get("date")),
         str(task.get("threshold")),
+        str(task.get("max_stops", DEFAULT_MAX_STOPS)),
+        str(task.get("connection_mode", DEFAULT_CONNECTION_MODE)),
+        str(task.get("min_connection_minutes")),
+        str(task.get("max_connection_minutes")),
+        str(task.get("avoid_overnight", True)),
+        str(task.get("allow_airport_change", False)),
     )
 
 
@@ -77,12 +125,22 @@ class TaskStore:
         dest: str,
         dates: Iterable[date],
         threshold: int,
+        max_stops: int = DEFAULT_MAX_STOPS,
+        connection_mode: str = DEFAULT_CONNECTION_MODE,
+        min_connection_minutes: int | None = None,
+        max_connection_minutes: int | None = None,
     ) -> str:
         request_id = uuid.uuid4().hex[:8]
         date_list = list(dates)
         if not date_list:
             raise ValueError("В заявке должна быть хотя бы одна дата.")
 
+        connection_settings = normalize_connection_settings(
+            max_stops,
+            connection_mode,
+            min_connection_minutes,
+            max_connection_minutes,
+        )
         new_tasks = [
             {
                 "request_id": request_id,
@@ -91,6 +149,7 @@ class TaskStore:
                 "dest": dest,
                 "date": flight_date.strftime("%d.%m.%Y"),
                 "threshold": threshold,
+                **connection_settings,
             }
             for flight_date in date_list
         ]
@@ -118,6 +177,12 @@ class TaskStore:
                     "origin": task.get("origin", "?"),
                     "dest": task.get("dest", "?"),
                     "threshold": task.get("threshold"),
+                    "max_stops": task.get("max_stops", DEFAULT_MAX_STOPS),
+                    "connection_mode": task.get("connection_mode", DEFAULT_CONNECTION_MODE),
+                    "min_connection_minutes": task.get("min_connection_minutes"),
+                    "max_connection_minutes": task.get("max_connection_minutes"),
+                    "avoid_overnight": task.get("avoid_overnight", True),
+                    "allow_airport_change": task.get("allow_airport_change", False),
                     "dates": [],
                 },
             )
@@ -140,6 +205,10 @@ class TaskStore:
         dest: str | None = None,
         dates: Iterable[date] | None = None,
         threshold: int | None = None,
+        max_stops: int | None = None,
+        connection_mode: str | None = None,
+        min_connection_minutes: int | None = None,
+        max_connection_minutes: int | None = None,
     ) -> bool:
         """Обновляет поля заявки, сохраняя её request_id."""
         chat_id = str(chat_id)
@@ -154,6 +223,15 @@ class TaskStore:
             if not matching:
                 return False
 
+            connection_settings = None
+            if max_stops is not None:
+                connection_settings = normalize_connection_settings(
+                    max_stops,
+                    connection_mode or DEFAULT_CONNECTION_MODE,
+                    min_connection_minutes,
+                    max_connection_minutes,
+                )
+
             if dates is None:
                 for task in matching:
                     if origin is not None:
@@ -162,6 +240,8 @@ class TaskStore:
                         task["dest"] = dest
                     if threshold is not None:
                         task["threshold"] = threshold
+                    if connection_settings is not None:
+                        task.update(connection_settings)
                 self._write_unlocked(tasks)
                 return True
 
@@ -180,9 +260,18 @@ class TaskStore:
                     "dest": dest if dest is not None else template.get("dest"),
                     "date": flight_date.strftime("%d.%m.%Y"),
                     "threshold": threshold if threshold is not None else template.get("threshold"),
+                    "max_stops": template.get("max_stops", DEFAULT_MAX_STOPS),
+                    "connection_mode": template.get("connection_mode", DEFAULT_CONNECTION_MODE),
+                    "min_connection_minutes": template.get("min_connection_minutes"),
+                    "max_connection_minutes": template.get("max_connection_minutes"),
+                    "avoid_overnight": template.get("avoid_overnight", True),
+                    "allow_airport_change": template.get("allow_airport_change", False),
                 }
                 for flight_date in date_list
             ]
+            if connection_settings is not None:
+                for task in replacement:
+                    task.update(connection_settings)
             remaining[first_index:first_index] = replacement
             self._write_unlocked(remaining)
             return True

@@ -23,6 +23,12 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 from telegram import Bot
 from telegram.error import TelegramError
 
+from itinerary import (
+    FlightOffer,
+    cheapest_matching_offer,
+    minutes_text,
+    parse_offer_text,
+)
 from task_store import contains_task
 
 # ── Настройки ──────────────────────────────────────────────────────────────────
@@ -191,6 +197,90 @@ async def _extract_min_price(page) -> int | None:
     return None
 
 
+async def _extract_offers(page) -> list[FlightOffer]:
+    """Извлекает отдельные карточки маршрутов и преобразует их в варианты."""
+    card_texts = await page.evaluate(r"""
+        () => {
+            const results = new Set();
+            const pricePattern = /\d[\d\s\u00a0]{2,8}\d\s*(?:₽|Р\b)/i;
+            const timePattern = /\b(?:[01]?\d|2[0-3]):[0-5]\d\b/g;
+            const routePattern = /без пересад|\d+\s+пересад|прямой рейс|стыковк|в пути/i;
+            const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+            let node;
+            while ((node = walker.nextNode())) {
+                const ownText = (node.textContent || '').replace(/\s+/g, ' ').trim();
+                if (!pricePattern.test(ownText)) continue;
+
+                let element = node.parentElement;
+                let selected = null;
+                for (let depth = 0; element && element !== document.body && depth < 10; depth++) {
+                    const rect = element.getBoundingClientRect();
+                    const text = (element.innerText || element.textContent || '')
+                        .replace(/\s+/g, ' ')
+                        .trim();
+                    const times = text.match(timePattern) || [];
+                    if (
+                        rect.width > 0 && rect.height > 0 &&
+                        text.length >= 20 && text.length <= 5000 &&
+                        times.length >= 2 && routePattern.test(text)
+                    ) {
+                        selected = text;
+                        break;
+                    }
+                    element = element.parentElement;
+                }
+                if (selected) results.add(selected);
+            }
+            return Array.from(results);
+        }
+    """)
+
+    offers: list[FlightOffer] = []
+    seen = set()
+    for text in card_texts:
+        offer = parse_offer_text(text)
+        if offer is None:
+            continue
+        key = (
+            offer.price,
+            offer.stops,
+            offer.layovers,
+            offer.route,
+            offer.total_duration_minutes,
+        )
+        if key not in seen:
+            seen.add(key)
+            offers.append(offer)
+    return offers
+
+
+def _offer_log_text(offer: FlightOffer) -> str:
+    parts = [f"пересадок: {offer.stops}"]
+    if offer.layovers:
+        parts.append("стыковки: " + ", ".join(minutes_text(value) for value in offer.layovers))
+    if offer.total_duration_minutes is not None:
+        parts.append(f"в пути: {minutes_text(offer.total_duration_minutes)}")
+    return "; ".join(parts)
+
+
+def _offer_message_lines(offer: FlightOffer) -> list[str]:
+    if offer.stops == 0:
+        lines = ["🔄 Пересадки: <b>прямой рейс</b>"]
+    else:
+        lines = [f"🔄 Пересадки: <b>{offer.stops}</b>"]
+        if len(offer.route) > 2:
+            lines.append(f"🧭 Через: <b>{' → '.join(offer.route[1:-1])}</b>")
+        if offer.layovers:
+            lines.append(
+                "⏱ Стыковки: <b>"
+                + ", ".join(minutes_text(value) for value in offer.layovers)
+                + "</b>"
+            )
+    if offer.total_duration_minutes is not None:
+        lines.append(f"🕒 В пути: <b>{minutes_text(offer.total_duration_minutes)}</b>")
+    return lines
+
+
 async def process_task(context, task: dict, is_test: bool = False) -> None:
     """Обрабатывает одно задание: открывает вкладку, парсит, отправляет уведомление."""
     origin = task['origin']
@@ -227,28 +317,40 @@ async def process_task(context, task: dict, is_test: bool = False) -> None:
         except PlaywrightTimeoutError:
             log.warning("Карточки рейсов не появились, но попробуем спарсить...")
 
-        price = await _extract_min_price(page)
+        offers = await _extract_offers(page)
+        selected_offer = cheapest_matching_offer(task, offers)
+        price = selected_offer.price if selected_offer else None
 
         if price is None:
-            log.warning("Цена не найдена.")
-            save_to_csv(task, search_url, None, "Ошибка парсинга")
+            if offers:
+                note = "Нет маршрутов, подходящих по пересадкам"
+                log.info("%s. Найдено вариантов до фильтрации: %s", note, len(offers))
+            else:
+                note = "Не удалось разобрать карточки маршрутов"
+                log.warning("%s.", note)
+            save_to_csv(task, search_url, None, note)
             if is_test:
-                await send_telegram(chat_id, f"❌ Ошибка получения цены {origin} → {dest} | {date}")
+                await send_telegram(chat_id, f"❌ {note}: {origin} → {dest} | {date}")
         else:
-            log.info(f"Найдена цена: {price} ₽")
-            save_to_csv(task, search_url, price)
+            details = _offer_log_text(selected_offer)
+            log.info("Найден подходящий маршрут: %s ₽ (%s)", price, details)
+            save_to_csv(task, search_url, price, details)
 
             # Отправка уведомления
             if price < threshold or is_test:
                 emoji = "🔥" if price < threshold else "ℹ️"
                 reason = "ЦЕНА УПАЛА!" if price < threshold else "Тестовый запуск"
+                offer_lines = "\n".join(_offer_message_lines(selected_offer))
+                price_text = f"{price:,}".replace(",", " ")
+                threshold_text = f"{threshold:,}".replace(",", " ")
 
                 msg = (
                     f"{emoji} <b>{reason}</b>\n\n"
                     f"✈️ <b>{origin} → {dest}</b>\n"
                     f"📅 Дата: {date}\n"
-                    f"💰 Цена: <b>{price:,} ₽</b>\n".replace(",", " ") +
-                    f"🎯 Ваш порог: {threshold:,} ₽\n".replace(",", " ") +
+                    f"{offer_lines}\n"
+                    f"💰 Цена: <b>{price_text} ₽</b>\n"
+                    f"🎯 Ваш порог: {threshold_text} ₽\n"
                     f"🔗 <a href=\"{search_url}\">Купить билет</a>"
                 )
                 await send_telegram(chat_id, msg)
