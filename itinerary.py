@@ -9,7 +9,10 @@ from typing import Iterable
 
 RUB_PRICE_RE = re.compile(r"(\d[\d\s\u00a0]{2,8}\d)\s*(?:₽|Р\b)", re.IGNORECASE)
 TIME_RE = re.compile(r"\b(?:[01]?\d|2[0-3]):[0-5]\d\b")
-STOPS_RE = re.compile(r"(?<![:\d])\b([012])\s+пересад", re.IGNORECASE)
+STOPS_RE = re.compile(
+    r"(?<![:\d])\b(\d)\s*(?:пересад|останов|stop)",
+    re.IGNORECASE,
+)
 DURATION_RE = re.compile(
     r"(?:в пути|общее время|продолжительность)[^\d]{0,30}(?:(\d+)\s*(?:дн|день|дня|дней))?"
     r"\s*(?:(\d+)\s*ч)?\s*(?:(\d+)\s*мин)?",
@@ -51,23 +54,52 @@ def parse_offer_text(text: str) -> FlightOffer | None:
         return None
 
     lower = compact.lower()
-    if "без пересад" in lower or "прямой рейс" in lower:
-        stops = 0
-    else:
-        stop_match = STOPS_RE.search(compact)
-        if stop_match:
-            stops = int(stop_match.group(1))
-        else:
-            times_count = len(TIME_RE.findall(compact))
-            if times_count < 2:
-                return None
-            stops = max(0, min(2, times_count // 2 - 1))
-
     layovers = tuple(
         value
         for match in LAYOVER_RE.finditer(compact)
         if (value := _duration_minutes(match)) is not None
     )
+    clock_values = []
+    for value in TIME_RE.findall(compact):
+        hours, minutes = value.split(":")
+        clock_values.append(int(hours) * 60 + int(minutes))
+
+    stops: int | None = None
+    if "без пересад" in lower or "прямой рейс" in lower or "non-stop" in lower:
+        stops = 0
+    else:
+        stop_match = STOPS_RE.search(compact)
+        if stop_match:
+            stops = int(stop_match.group(1))
+        elif re.search(r"(?:с\s+)?одн(?:ой|а)\s+пересад", lower):
+            stops = 1
+        elif re.search(r"(?:с\s+)?дв(?:е|умя)\s+пересад", lower):
+            stops = 2
+        elif layovers:
+            stops = len(layovers)
+        elif re.search(r"пересадк|стыковк|\bчерез\b", lower):
+            stops = 1
+        elif len(clock_values) >= 4 and len(clock_values) % 2 == 0:
+            stops = min(3, len(clock_values) // 2 - 1)
+
+    # Две видимые отметки могут быть общими временем вылета и прилёта свёрнутого
+    # маршрута с пересадкой. Без явной пометки не называем такой вариант прямым.
+    if stops is None:
+        return None
+
+    expected_times = 2 * (stops + 1)
+    if stops and len(layovers) < stops and len(clock_values) >= expected_times:
+        segment_times = clock_values[-expected_times:]
+        calculated_layovers = []
+        for index in range(stops):
+            arrival = segment_times[index * 2 + 1]
+            departure = segment_times[index * 2 + 2]
+            wait = departure - arrival
+            if wait <= 0:
+                wait += 1440
+            calculated_layovers.append(wait)
+        layovers = tuple(calculated_layovers)
+
     duration_match = DURATION_RE.search(compact)
     total_duration = _duration_minutes(duration_match) if duration_match else None
 
@@ -77,14 +109,9 @@ def parse_offer_text(text: str) -> FlightOffer | None:
         if code not in {"RUB", "RUR"} and (not route or route[-1] != code):
             route.append(code)
 
-    clock_values = []
-    for value in TIME_RE.findall(compact):
-        hours, minutes = value.split(":")
-        clock_values.append(int(hours) * 60 + int(minutes))
     overnight = bool(re.search(r"ночн|на следующий день", lower))
-    expected_times = 2 * (stops + 1)
     if stops and len(clock_values) >= expected_times:
-        segment_times = clock_values[:expected_times]
+        segment_times = clock_values[-expected_times:]
         overnight = overnight or any(
             segment_times[index * 2 + 2] < segment_times[index * 2 + 1]
             for index in range(stops)

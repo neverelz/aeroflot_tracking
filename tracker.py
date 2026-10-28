@@ -234,7 +234,13 @@ async def _extract_offers(page) -> list[FlightOffer]:
             const results = new Set();
             const pricePattern = /\d[\d\s\u00a0]{2,8}\d\s*(?:₽|Р\b)/i;
             const timePattern = /\b(?:[01]?\d|2[0-3]):[0-5]\d\b/g;
-            const routePattern = /без пересад|\d+\s+пересад|прямой рейс|стыковк|в пути/i;
+            const routePattern = /без пересад|пересад|стыковк|прямой рейс|в пути|останов|stop|через/i;
+            const semanticSelector = [
+                '[class*="flight"]', '[class*="Flight"]',
+                '[class*="offer"]', '[class*="Offer"]',
+                '[class*="route"]', '[class*="Route"]',
+                '[data-testid*="flight"]', '[data-testid*="offer"]'
+            ].join(',');
             const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
             let node;
             while ((node = walker.nextNode())) {
@@ -243,23 +249,41 @@ async def _extract_offers(page) -> list[FlightOffer]:
 
                 let element = node.parentElement;
                 let selected = null;
-                for (let depth = 0; element && element !== document.body && depth < 10; depth++) {
-                    const rect = element.getBoundingClientRect();
-                    const text = (element.innerText || element.textContent || '')
-                        .replace(/\s+/g, ' ')
-                        .trim();
+                let fallback = null;
+                const semantic = element ? element.closest(semanticSelector) : null;
+                if (semantic) {
+                    const rect = semantic.getBoundingClientRect();
+                    const text = (semantic.textContent || '').replace(/\s+/g, ' ').trim();
                     const times = text.match(timePattern) || [];
-                    if (
-                        rect.width > 0 && rect.height > 0 &&
-                        text.length >= 20 && text.length <= 5000 &&
-                        times.length >= 2 && routePattern.test(text)
-                    ) {
+                    if (rect.width > 0 && rect.height > 0 && rect.height <= 1200 &&
+                        text.length >= 20 && text.length <= 5000 && times.length >= 2) {
                         selected = text;
-                        break;
                     }
-                    element = element.parentElement;
                 }
-                if (selected) results.add(selected);
+                if (!selected) {
+                    for (let depth = 0; element && element !== document.body && depth < 10; depth++) {
+                        const rect = element.getBoundingClientRect();
+                        // textContent включает детали сегментов, скрытые до раскрытия карточки.
+                        const text = (element.textContent || '')
+                            .replace(/\s+/g, ' ')
+                            .trim();
+                        const times = text.match(timePattern) || [];
+                        if (
+                            rect.width > 0 && rect.height > 0 &&
+                            rect.height <= 1200 &&
+                            text.length >= 20 && text.length <= 5000 &&
+                            times.length >= 2
+                        ) {
+                            if (!fallback) fallback = text;
+                            if (routePattern.test(text)) {
+                                selected = text;
+                                break;
+                            }
+                        }
+                        element = element.parentElement;
+                    }
+                }
+                if (selected || fallback) results.add(selected || fallback);
             }
             return Array.from(results);
         }
@@ -270,6 +294,7 @@ async def _extract_offers(page) -> list[FlightOffer]:
     for text in card_texts:
         offer = parse_offer_text(text)
         if offer is None:
+            log.warning("Не удалось распознать карточку: %s", " ".join(text.split())[:1000])
             continue
         key = (
             offer.price,
@@ -281,6 +306,7 @@ async def _extract_offers(page) -> list[FlightOffer]:
         if key not in seen:
             seen.add(key)
             offers.append(offer)
+    log.info("Карточек найдено: %s, распознано маршрутов: %s", len(card_texts), len(offers))
     return offers
 
 

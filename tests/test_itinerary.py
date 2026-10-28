@@ -24,6 +24,18 @@ class ItineraryTests(unittest.TestCase):
         self.assertEqual(offer.layovers, (135,))
         self.assertEqual(offer.route, ("SVO", "ALA", "SCO"))
 
+    def test_infers_connection_from_hidden_segment_times(self):
+        offer = parse_offer_text(
+            "SVO 08:00 ALA 11:00 ALA 13:00 SCO 15:00 В пути 7 ч от 20 000 ₽"
+        )
+        self.assertIsNotNone(offer)
+        self.assertEqual(offer.stops, 1)
+        self.assertEqual(offer.layovers, (120,))
+
+    def test_does_not_call_collapsed_unknown_route_direct(self):
+        offer = parse_offer_text("SVO 08:00 SCO 15:00 В пути 7 ч от 20 000 ₽")
+        self.assertIsNone(offer)
+
     def test_filter_uses_max_stops_and_connection_window(self):
         task = {
             "max_stops": 1,
