@@ -11,7 +11,7 @@ services:
       DATA_DIR: /app/data
       TZ: Europe/Moscow
     volumes:
-      - ./data:/app/data:Z
+      - aeroflot_data:/app/data
     init: true
     restart: unless-stopped
 
@@ -28,9 +28,13 @@ services:
       HEADLESS: "true"
       TZ: Europe/Moscow
     volumes:
-      - ./data:/app/data:Z
+      - aeroflot_data:/app/data
     init: true
     restart: unless-stopped
     shm_size: 1gb
     depends_on:
       - bot
+
+volumes:
+  aeroflot_data:
+    name: aeroflot_tracking_data

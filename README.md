@@ -39,7 +39,7 @@ CHECK_INTERVAL=3
 docker compose up --build -d
 ```
 
-Команда поднимет два контейнера: `bot` принимает заявки, а `tracker` проверяет цены в headless Chromium. Оба контейнера автоматически перезапускаются и используют общий каталог `data/`.
+Команда поднимет два контейнера: `bot` принимает заявки, а `tracker` проверяет цены в headless Chromium. Оба контейнера автоматически перезапускаются и используют общий Docker volume `aeroflot_tracking_data`.
 
 Образ собирается на базе `python:3.10-slim-bookworm`; Chromium устанавливается из репозитория Debian. Доступ к `mcr.microsoft.com` и скачивание браузера через Playwright CDN не требуются.
 
@@ -59,25 +59,17 @@ docker compose down
 docker compose up --build -d
 ```
 
-Если в логах появляется `PermissionError: /app/data/...`, проверьте права bind mount:
+Если в старой установке использовался bind mount `./data:/app/data`, его можно перенести в named volume после первого запуска новых контейнеров:
 
 ```bash
-ls -ld data data/*
-sudo chown -R "$(id -u):$(id -g)" data
-chmod -R u+rwX data
-docker compose up -d --build
+docker compose stop bot tracker
+docker compose cp ./data/. bot:/app/data/
+docker compose start bot tracker
 ```
 
-Трекер не останавливается из-за недоступности `tracker.log` или `prices.csv` и
-продолжает писать основной лог в `docker compose logs`. На серверах с SELinux в
-режиме `Enforcing` для обоих подключений `./data:/app/data` может дополнительно
-потребоваться суффикс `:Z`.
-
-Чтобы перенести ранее созданные локальные данные в Docker, один раз скопируйте нужные файлы в `data/`:
-
-```powershell
-Copy-Item tasks.json, prices.csv, tracker.log data\ -ErrorAction SilentlyContinue
-```
+Исходный каталог `./data` при этом не удаляется. Трекер также не останавливается
+из-за недоступности `tracker.log` или `prices.csv` и продолжает писать основной
+лог в `docker compose logs`.
 
 ### Без Docker
 
@@ -121,7 +113,7 @@ python tracker.py --test
 
 ## Хранение данных
 
-При локальном запуске заявки сохраняются в `tasks.json`. В Docker те же файлы находятся в каталоге `data/`: `data/tasks.json`, `data/prices.csv` и `data/tracker.log`. Бот записывает JSON атомарно, поэтому трекер не увидит частично сохранённый файл.
+При локальном запуске заявки сохраняются в `tasks.json`. В Docker файлы `tasks.json`, `prices.csv` и `tracker.log` находятся в volume `aeroflot_tracking_data`, смонтированном как `/app/data`. Бот записывает JSON атомарно, поэтому трекер не увидит частично сохранённый файл.
 
 Пример задачи:
 
