@@ -11,7 +11,7 @@ services:
       DATA_DIR: /app/data
       TZ: Europe/Moscow
     volumes:
-      - ./data:/app/data
+      - ./data:/app/data:Z
     init: true
     restart: unless-stopped
 
@@ -28,7 +28,7 @@ services:
       HEADLESS: "true"
       TZ: Europe/Moscow
     volumes:
-      - ./data:/app/data
+      - ./data:/app/data:Z
     init: true
     restart: unless-stopped
     shm_size: 1gb
