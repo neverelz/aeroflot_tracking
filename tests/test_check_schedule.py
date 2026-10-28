@@ -47,6 +47,16 @@ class CheckScheduleTests(unittest.TestCase):
         self.assertEqual(gap_seconds_remaining(state, self.now + timedelta(seconds=3), 10), 7)
         self.assertEqual(gap_seconds_remaining(state, self.now + timedelta(seconds=10), 10), 0)
 
+        state["last_finished_at"] = (self.now + timedelta(seconds=20)).isoformat()
+        self.assertEqual(
+            gap_seconds_remaining(state, self.now + timedelta(seconds=23), 10),
+            7,
+        )
+        self.assertEqual(
+            gap_seconds_remaining(state, self.now + timedelta(seconds=30), 10),
+            0,
+        )
+
     def test_requests_are_selected_round_robin(self):
         first_a = make_task("a", "01.11.2026", "1")
         second_a = make_task("a", "02.11.2026", "1")

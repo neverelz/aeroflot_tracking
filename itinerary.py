@@ -27,6 +27,31 @@ LAYOVER_RE = re.compile(
 IATA_RE = re.compile(r"\b[A-Z]{3}\b")
 
 
+def classify_search_page(text: str) -> str | None:
+    """Отличает блокировку сайта и отсутствие единого маршрута от сбоя DOM."""
+    normalized = " ".join(text.lower().split())
+    blocked = (
+        "доступ к сайту временно ограничен",
+        "access to the site is temporarily restricted",
+        "доступ запрещен",
+        "captcha",
+    )
+    if any(marker in normalized for marker in blocked):
+        return "Аэрофлот ограничил доступ для IP-адреса сервера"
+    no_routes = (
+        "рейсы не найдены",
+        "рейсов не найдено",
+        "нет доступных рейсов",
+        "не нашли подходящие рейсы",
+        "маршрут не найден",
+        "flights not found",
+        "no flights found",
+    )
+    if any(marker in normalized for marker in no_routes):
+        return "Аэрофлот не предлагает единый маршрут для выбранной даты"
+    return None
+
+
 @dataclass(frozen=True)
 class FlightOffer:
     price: int

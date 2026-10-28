@@ -25,8 +25,9 @@ def request_schedule_key(task: dict) -> str:
 
 def empty_state() -> dict:
     return {
-        "version": 1,
+        "version": 2,
         "last_started_at": None,
+        "last_finished_at": None,
         "checked_at": {},
         "request_started_at": {},
     }
@@ -51,10 +52,17 @@ def task_is_due(task: dict, state: dict, now: datetime, interval: timedelta) -> 
 
 
 def gap_seconds_remaining(state: dict, now: datetime, minimum_gap: float) -> float:
-    last_started = parse_timestamp(state.get("last_started_at"))
-    if last_started is None:
+    timestamps = [
+        parsed
+        for parsed in (
+            parse_timestamp(state.get("last_started_at")),
+            parse_timestamp(state.get("last_finished_at")),
+        )
+        if parsed is not None
+    ]
+    if not timestamps:
         return 0.0
-    return max(0.0, minimum_gap - (now - last_started).total_seconds())
+    return max(0.0, minimum_gap - (now - max(timestamps)).total_seconds())
 
 
 def next_due_task(
@@ -108,8 +116,9 @@ class CheckStateStore:
             raise RuntimeError(f"Не удалось прочитать {self.path.name}: {exc}") from exc
         if not isinstance(data, dict) or not isinstance(data.get("checked_at", {}), dict):
             raise RuntimeError(f"Некорректный формат {self.path.name}")
-        data.setdefault("version", 1)
+        data.setdefault("version", 2)
         data.setdefault("last_started_at", None)
+        data.setdefault("last_finished_at", None)
         data.setdefault("checked_at", {})
         data.setdefault("request_started_at", {})
         return data

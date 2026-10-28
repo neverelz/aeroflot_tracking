@@ -24,6 +24,7 @@ from telegram.error import TelegramError
 from itinerary import (
     FlightOffer,
     cheapest_matching_offer,
+    classify_search_page,
     minutes_text,
     parse_offer_text,
 )
@@ -106,7 +107,7 @@ def generate_aeroflot_url(origin: str, dest: str, date_str: str) -> str:
     date_obj = datetime.strptime(date_str, "%d.%m.%Y")
     url_date = date_obj.strftime("%Y%m%d")
     return (
-        "https://www.aeroflot.ru/ru-ru/sb/search"
+        "https://www.aeroflot.ru/sb/search"
         f"?adults=1&infants=0&children=0&childrenfrgn=0&childrenaward=0"
         f"&cabin=economy&routes={origin}.{url_date}.{dest}"
     )
@@ -310,6 +311,29 @@ async def _extract_offers(page) -> list[FlightOffer]:
     return offers
 
 
+async def _detect_page_problem(page) -> str | None:
+    """Отличает блокировку и отсутствие маршрута от изменения HTML-карточек."""
+    try:
+        body_text = " ".join((await page.locator("body").inner_text(timeout=5_000)).split())
+    except Exception:
+        return None
+    return classify_search_page(body_text)
+
+
+async def _log_page_diagnostic(page) -> None:
+    try:
+        title = await page.title()
+        body_text = " ".join((await page.locator("body").inner_text(timeout=5_000)).split())
+        log.warning(
+            "Диагностика страницы: title=%r, url=%s, текст=%r",
+            title,
+            page.url,
+            body_text[:700],
+        )
+    except Exception as exc:
+        log.warning("Не удалось прочитать диагностический текст страницы: %s", exc)
+
+
 def _offer_log_text(offer: FlightOffer) -> str:
     parts = [f"пересадок: {offer.stops}"]
     if offer.layovers:
@@ -356,6 +380,14 @@ async def process_task(context, task: dict, is_test: bool = False) -> None:
     try:
         await page.goto(search_url, wait_until="domcontentloaded", timeout=60_000)
 
+        page_problem = await _detect_page_problem(page)
+        if page_problem:
+            log.warning("%s: %s → %s | %s", page_problem, origin, dest, date)
+            save_to_csv(task, search_url, None, page_problem)
+            if is_test:
+                await send_telegram(chat_id, f"❌ {page_problem}: {origin} → {dest} | {date}")
+            return
+
         # Закрываем куки
         try:
             cookie_btn = await page.wait_for_selector(
@@ -373,6 +405,14 @@ async def process_task(context, task: dict, is_test: bool = False) -> None:
         except PlaywrightTimeoutError:
             log.warning("Карточки рейсов не появились, но попробуем спарсить...")
 
+        page_problem = await _detect_page_problem(page)
+        if page_problem:
+            log.warning("%s: %s → %s | %s", page_problem, origin, dest, date)
+            save_to_csv(task, search_url, None, page_problem)
+            if is_test:
+                await send_telegram(chat_id, f"❌ {page_problem}: {origin} → {dest} | {date}")
+            return
+
         offers = await _extract_offers(page)
         selected_offer = cheapest_matching_offer(task, offers)
         price = selected_offer.price if selected_offer else None
@@ -382,8 +422,9 @@ async def process_task(context, task: dict, is_test: bool = False) -> None:
                 note = "Нет маршрутов, подходящих по пересадкам"
                 log.info("%s. Найдено вариантов до фильтрации: %s", note, len(offers))
             else:
-                note = "Не удалось разобрать карточки маршрутов"
+                note = "Аэрофлот не вернул единый маршрут или изменил страницу поиска"
                 log.warning("%s.", note)
+                await _log_page_diagnostic(page)
             save_to_csv(task, search_url, None, note)
             if is_test:
                 await send_telegram(chat_id, f"❌ {note}: {origin} → {dest} | {date}")
@@ -524,7 +565,9 @@ async def run_due_tasks(
                 await process_task(context, task, is_test)
 
                 key = task_schedule_key(task)
-                state.setdefault("checked_at", {})[key] = started_text
+                finished_text = utc_now().isoformat()
+                state["last_finished_at"] = finished_text
+                state.setdefault("checked_at", {})[key] = finished_text
                 processed_in_test.add(key)
                 _save_check_state(state_store, state)
                 checked_count += 1
@@ -541,19 +584,12 @@ async def scheduler_loop(*, is_test: bool = False) -> None:
     state = _load_check_state(state_store)
     if is_test:
         log.info("🧪 ТЕСТОВЫЙ РЕЖИМ")
-    else:
-        log.info(
-            "🚀 Планировщик запущен: новые заявки — сразу, затем каждые %s ч.; "
-            "минимальный интервал между проверками — %s сек.",
-            CHECK_INTERVAL_HOURS,
-            MIN_CHECK_GAP_SECONDS,
-        )
         await run_due_tasks(state_store, state, is_test=True)
         return
 
     log.info(
-        "🚀 Трекер запущен. Каждая задача проверяется раз в %s ч.; "
-        "новые задачи — сразу; интервал между проверками — не менее %s сек.",
+        "🚀 Планировщик запущен: новые заявки — сразу, затем каждые %s ч.; "
+        "пауза после каждой проверки — не менее %s сек.",
         CHECK_INTERVAL_HOURS,
         MIN_CHECK_GAP_SECONDS,
     )

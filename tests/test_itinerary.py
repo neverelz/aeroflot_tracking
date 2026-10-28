@@ -1,9 +1,26 @@
 import unittest
 
-from itinerary import FlightOffer, cheapest_matching_offer, offer_matches, parse_offer_text
+from itinerary import (
+    FlightOffer,
+    cheapest_matching_offer,
+    classify_search_page,
+    offer_matches,
+    parse_offer_text,
+)
 
 
 class ItineraryTests(unittest.TestCase):
+    def test_classifies_block_and_no_route_pages(self):
+        self.assertIn(
+            "ограничил доступ",
+            classify_search_page("Доступ к сайту временно ограничен владельцем веб-ресурса"),
+        )
+        self.assertIn(
+            "не предлагает единый маршрут",
+            classify_search_page("Рейсы не найдены"),
+        )
+        self.assertIsNone(classify_search_page("Выберите подходящий рейс"))
+
     def test_parse_direct_offer(self):
         offer = parse_offer_text(
             "SVO 10:20 SCO 15:10 Без пересадок В пути 3 ч 50 мин от 18 450 ₽"
