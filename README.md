@@ -59,6 +59,20 @@ docker compose down
 docker compose up --build -d
 ```
 
+Если в логах появляется `PermissionError: /app/data/...`, проверьте права bind mount:
+
+```bash
+ls -ld data data/*
+sudo chown -R "$(id -u):$(id -g)" data
+chmod -R u+rwX data
+docker compose up -d --build
+```
+
+Трекер не останавливается из-за недоступности `tracker.log` или `prices.csv` и
+продолжает писать основной лог в `docker compose logs`. На серверах с SELinux в
+режиме `Enforcing` для обоих подключений `./data:/app/data` может дополнительно
+потребоваться суффикс `:Z`.
+
 Чтобы перенести ранее созданные локальные данные в Docker, один раз скопируйте нужные файлы в `data/`:
 
 ```powershell

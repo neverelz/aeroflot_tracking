@@ -47,15 +47,28 @@ TASKS_FILE = DATA_DIR / "tasks.json"
 LOG_FILE = DATA_DIR / "tracker.log"
 
 # ── Логирование ────────────────────────────────────────────────────────────────
+# Docker-лог в stdout обязателен, а файловый лог — дополнительный. Примонтированный
+# каталог может принадлежать другому UID или быть защищён SELinux, и это не должно
+# останавливать трекер до запуска.
+log_handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+file_log_error: OSError | None = None
+try:
+    log_handlers.append(logging.FileHandler(LOG_FILE, encoding="utf-8"))
+except OSError as exc:
+    file_log_error = exc
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
-    ],
+    handlers=log_handlers,
 )
 log = logging.getLogger(__name__)
+if file_log_error is not None:
+    log.warning(
+        "Нет доступа к файловому логу %s (%s). Продолжаем с логами Docker.",
+        LOG_FILE,
+        file_log_error,
+    )
 # httpx включает токен Telegram в URL на уровне INFO — не пишем такие строки в лог.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
@@ -72,9 +85,9 @@ def load_tasks() -> list[dict]:
         with open(TASKS_FILE, "r", encoding="utf-8") as f:
             tasks = json.load(f)
             return tasks
-    except Exception as e:
-        log.error(f"Ошибка чтения tasks.json: {e}")
-        sys.exit(1)
+    except (OSError, json.JSONDecodeError) as exc:
+        log.error("Ошибка чтения %s: %s. Повторим при следующей проверке.", TASKS_FILE, exc)
+        return []
 
 
 def generate_aeroflot_url(origin: str, dest: str, date_str: str) -> str:
@@ -92,26 +105,32 @@ def generate_aeroflot_url(origin: str, dest: str, date_str: str) -> str:
 def init_csv() -> None:
     """Создаёт CSV с заголовком, если файл не существует."""
     if not CSV_FILE.exists():
-        with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            # Добавили chat_id и маршрут, чтобы не путать данные разных пользователей
-            writer.writerow(["timestamp", "chat_id", "route", "date", "price_rub", "url", "note"])
-        log.info("Создан файл %s", CSV_FILE)
+        try:
+            with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                # Добавили chat_id и маршрут, чтобы не путать данные разных пользователей
+                writer.writerow(["timestamp", "chat_id", "route", "date", "price_rub", "url", "note"])
+            log.info("Создан файл %s", CSV_FILE)
+        except OSError as exc:
+            log.warning("Не удалось создать %s: %s. Работаем без истории CSV.", CSV_FILE, exc)
 
 
 def save_to_csv(task: dict, search_url: str, price: int | None, note: str = "") -> None:
     """Сохраняет запись в CSV."""
-    with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            task.get("chat_id"),
-            f"{task.get('origin')}->{task.get('dest')}",
-            task.get("date"),
-            price if price is not None else "N/A",
-            search_url,
-            note,
-        ])
+    try:
+        with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                task.get("chat_id"),
+                f"{task.get('origin')}->{task.get('dest')}",
+                task.get("date"),
+                price if price is not None else "N/A",
+                search_url,
+                note,
+            ])
+    except OSError as exc:
+        log.warning("Не удалось записать историю в %s: %s", CSV_FILE, exc)
 
 
 # ── Telegram ───────────────────────────────────────────────────────────────────
