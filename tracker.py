@@ -13,11 +13,9 @@ import json
 import logging
 import os
 import sys
-import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
-import schedule
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 from telegram import Bot
@@ -29,13 +27,25 @@ from itinerary import (
     minutes_text,
     parse_offer_text,
 )
+from check_schedule import (
+    CheckStateStore,
+    empty_state,
+    gap_seconds_remaining,
+    next_due_task,
+    prune_state,
+    request_schedule_key,
+    task_schedule_key,
+    utc_now,
+)
 from task_store import contains_task
 
 # ── Настройки ──────────────────────────────────────────────────────────────────
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-CHECK_INTERVAL     = int(os.getenv("CHECK_INTERVAL", "3"))
+CHECK_INTERVAL_HOURS = max(0.01, float(os.getenv("CHECK_INTERVAL", "3")))
+MIN_CHECK_GAP_SECONDS = max(10.0, float(os.getenv("MIN_CHECK_GAP_SECONDS", "10")))
+QUEUE_POLL_SECONDS = max(1.0, float(os.getenv("QUEUE_POLL_SECONDS", "5")))
 HEADLESS           = os.getenv("HEADLESS", "false").strip().lower() in {"1", "true", "yes", "on"}
 CHROMIUM_EXECUTABLE_PATH = os.getenv("CHROMIUM_EXECUTABLE_PATH", "").strip()
 
@@ -45,6 +55,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 CSV_FILE = DATA_DIR / "prices.csv"
 TASKS_FILE = DATA_DIR / "tasks.json"
 LOG_FILE = DATA_DIR / "tracker.log"
+STATE_FILE = DATA_DIR / "check_state.json"
 
 # ── Логирование ────────────────────────────────────────────────────────────────
 # Docker-лог в stdout обязателен, а файловый лог — дополнительный. Примонтированный
@@ -78,7 +89,7 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 def load_tasks() -> list[dict]:
     """Загружает список задач для проверки из JSON файла."""
     if not TASKS_FILE.exists():
-        log.warning("Файл %s пока не создан — ожидаем первую заявку из бота.", TASKS_FILE)
+        log.debug("Файл %s пока не создан — ожидаем первую заявку из бота.", TASKS_FILE)
         return []
 
     try:
@@ -383,15 +394,45 @@ async def process_task(context, task: dict, is_test: bool = False) -> None:
 
 
 # ── Главный цикл ───────────────────────────────────────────────────────────────
-async def run_all_tasks(is_test: bool = False) -> None:
-    """Запускает браузер один раз и проходит по всем задачам из tasks.json."""
-    tasks = load_tasks()
-    if not tasks:
-        log.warning("Список задач пуст!")
-        return
+def _load_check_state(state_store: CheckStateStore) -> dict:
+    try:
+        return state_store.load()
+    except RuntimeError as exc:
+        log.error("%s. Начинаем новое расписание.", exc)
+        return empty_state()
 
-    log.info(f"=== Запуск цикла проверок. Задач в очереди: {len(tasks)} ===")
 
+def _save_check_state(state_store: CheckStateStore, state: dict) -> None:
+    try:
+        state_store.save(state)
+    except OSError as exc:
+        # В памяти расписание продолжает работать корректно до перезапуска.
+        log.warning("Не удалось сохранить %s: %s", state_store.path, exc)
+
+
+async def run_due_tasks(
+    state_store: CheckStateStore,
+    state: dict,
+    *,
+    is_test: bool = False,
+) -> int:
+    """Проверяет все задачи, срок которых наступил, замечая новые заявки на ходу."""
+    interval = timedelta(0) if is_test else timedelta(hours=CHECK_INTERVAL_HOURS)
+    processed_in_test: set[str] = set()
+    initial_tasks = load_tasks()
+    if prune_state(state, initial_tasks):
+        _save_check_state(state_store, state)
+
+    candidate_tasks = initial_tasks
+    if is_test:
+        candidate_tasks = [
+            task for task in initial_tasks if task_schedule_key(task) not in processed_in_test
+        ]
+    if next_due_task(candidate_tasks, state, utc_now(), interval) is None:
+        return 0
+
+    checked_count = 0
+    log.info("=== Есть задачи для проверки ===")
     async with async_playwright() as p:
         launch_options = {
             "headless": HEADLESS,
@@ -402,59 +443,107 @@ async def run_all_tasks(is_test: bool = False) -> None:
             launch_options["executable_path"] = CHROMIUM_EXECUTABLE_PATH
 
         browser = await p.chromium.launch(**launch_options)
-
         context = await browser.new_context(
             viewport={"width": 1366, "height": 768},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             locale="ru-RU",
         )
-        await context.add_init_script("Object.defineProperty(navigator, 'webdriver', { get: () => undefined });")
+        await context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+        )
 
-        for i, task in enumerate(tasks):
-            if not contains_task(load_tasks(), task):
-                log.info(
-                    "Заявка %s на %s удалена — пропускаем.",
-                    task.get("request_id", "без номера"),
-                    task.get("date", "неизвестную дату"),
+        try:
+            while True:
+                tasks = load_tasks()
+                if prune_state(state, tasks):
+                    _save_check_state(state_store, state)
+                candidates = tasks
+                if is_test:
+                    candidates = [
+                        task
+                        for task in tasks
+                        if task_schedule_key(task) not in processed_in_test
+                    ]
+                task = next_due_task(candidates, state, utc_now(), interval)
+                if task is None:
+                    break
+
+                remaining = gap_seconds_remaining(
+                    state,
+                    utc_now(),
+                    MIN_CHECK_GAP_SECONDS,
                 )
-                continue
+                if remaining > 0:
+                    log.info("Пауза %.1f сек. до следующей проверки.", remaining)
+                    await asyncio.sleep(remaining)
 
-            await process_task(context, task, is_test)
+                # За время ожидания заявку могли удалить или изменить.
+                if not contains_task(load_tasks(), task):
+                    log.info(
+                        "Заявка %s на %s удалена или изменена — пропускаем.",
+                        task.get("request_id", "без номера"),
+                        task.get("date", "неизвестную дату"),
+                    )
+                    continue
 
-            # Делаем паузу между проверками разных билетов,
-            # чтобы Аэрофлот не забанил нас за частые запросы (кроме последней задачи)
-            if i < len(tasks) - 1:
-                log.info("Пауза 10 секунд перед следующим запросом...")
-                await asyncio.sleep(10)
+                started_at = utc_now()
+                started_text = started_at.isoformat()
+                state["last_started_at"] = started_text
+                state.setdefault("request_started_at", {})[
+                    request_schedule_key(task)
+                ] = started_text
+                _save_check_state(state_store, state)
 
-        await context.close()
-        await browser.close()
+                await process_task(context, task, is_test)
 
-    log.info("=== Цикл проверок завершен ===")
+                key = task_schedule_key(task)
+                state.setdefault("checked_at", {})[key] = started_text
+                processed_in_test.add(key)
+                _save_check_state(state_store, state)
+                checked_count += 1
+        finally:
+            await context.close()
+            await browser.close()
+
+    log.info("=== Проверено задач: %s ===", checked_count)
+    return checked_count
 
 
-def run_check(is_test: bool = False) -> None:
-    """Синхронная обёртка для schedule."""
-    asyncio.run(run_all_tasks(is_test=is_test))
+async def scheduler_loop(*, is_test: bool = False) -> None:
+    state_store = CheckStateStore(STATE_FILE)
+    state = _load_check_state(state_store)
+    if is_test:
+        log.info("🧪 ТЕСТОВЫЙ РЕЖИМ")
+    else:
+        log.info(
+            "🚀 Планировщик запущен: новые заявки — сразу, затем каждые %s ч.; "
+            "минимальный интервал между проверками — %s сек.",
+            CHECK_INTERVAL_HOURS,
+            MIN_CHECK_GAP_SECONDS,
+        )
+        await run_due_tasks(state_store, state, is_test=True)
+        return
+
+    log.info(
+        "🚀 Трекер запущен. Каждая задача проверяется раз в %s ч.; "
+        "новые задачи — сразу; интервал между проверками — не менее %s сек.",
+        CHECK_INTERVAL_HOURS,
+        MIN_CHECK_GAP_SECONDS,
+    )
+    while True:
+        try:
+            checked = await run_due_tasks(state_store, state)
+        except Exception:
+            log.exception("Ошибка цикла планировщика")
+            await asyncio.sleep(max(QUEUE_POLL_SECONDS, 30.0))
+            continue
+        await asyncio.sleep(0 if checked else QUEUE_POLL_SECONDS)
 
 
 def main() -> None:
-    is_test = "--test" in sys.argv
     init_csv()
-
-    if is_test:
-        log.info("🧪 ТЕСТОВЫЙ РЕЖИМ")
-        run_check(is_test=True)
-        return
-
-    log.info(f"🚀 Трекер запущен. Проверка каждые {CHECK_INTERVAL} ч.")
-    run_check()
-
-    schedule.every(CHECK_INTERVAL).hours.do(run_check)
-
-    while True:
-        schedule.run_pending()
-        time.sleep(60)
+    asyncio.run(scheduler_loop(is_test="--test" in sys.argv))
 
 
 if __name__ == "__main__":

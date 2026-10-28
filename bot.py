@@ -604,6 +604,14 @@ async def confirm_request(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return ConversationHandler.END
 
     dates_text = format_dates(context.user_data["dates"])
+    logger.info(
+        "Заявка %s сохранена: chat_id=%s, %s → %s, дат: %s",
+        request_id,
+        update.effective_chat.id,
+        context.user_data["origin"],
+        context.user_data["dest"],
+        len(context.user_data["dates"]),
+    )
     context.user_data.clear()
     await query.edit_message_text(
         f"✅ Заявка #{request_id} сохранена.\n"

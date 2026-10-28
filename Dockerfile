@@ -27,8 +27,8 @@ RUN set -eux; \
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py tracker.py task_store.py airport_catalog.py calendar_ui.py itinerary.py ./
-RUN python -m py_compile bot.py tracker.py task_store.py airport_catalog.py calendar_ui.py itinerary.py \
+COPY bot.py tracker.py task_store.py airport_catalog.py calendar_ui.py itinerary.py check_schedule.py ./
+RUN python -m py_compile bot.py tracker.py task_store.py airport_catalog.py calendar_ui.py itinerary.py check_schedule.py \
     && DATA_DIR=/proc python -c "import tracker"
 RUN mkdir -p /app/data
 
